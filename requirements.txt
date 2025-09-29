@@ -1,0 +1,9 @@
+Flask
+pandas
+folium
+scikit-learn
+numpy
+shapely
+scipy
+geopandas
+flask-session
