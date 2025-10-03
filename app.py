@@ -1,4 +1,7 @@
-from flask import Flask, render_template, request, jsonify, session, redirect
+import eventlet
+eventlet.monkey_patch()
+
+from flask import Flask, render_template, request, jsonify, session, redirect, Response
 import pandas as pd
 import folium
 from sklearn.cluster import DBSCAN
@@ -9,6 +12,71 @@ from shapely.ops import unary_union
 from scipy.spatial import ConvexHull
 import geopandas as gpd
 import os
+
+# pip install gpxpy  # Add this for GPX export
+import gpxpy
+import gpxpy.gpx
+
+# Disable verbose logging
+import logging
+logging.getLogger('socketio').setLevel(logging.ERROR)
+logging.getLogger('engineio').setLevel(logging.ERROR)
+logging.getLogger('eventlet').setLevel(logging.ERROR)
+logging.getLogger('eventletwebsocket.handler').setLevel(logging.ERROR)
+
+# --- Ultrasonic sensor setup (Jetson HC-SR04) ---
+import time
+
+TRIG_PIN = 7   # Physical pin 7
+ECHO_PIN = 15  # Physical pin 15
+GPIO = None
+ULTRASONIC_INITIALIZED = False
+ultrasonic_thread = None
+
+def get_ultrasonic_distance(debug=False):
+    global GPIO, ULTRASONIC_INITIALIZED
+    if not ULTRASONIC_INITIALIZED or GPIO is None:
+        return -1
+    try:
+        # Send 10us pulse to trigger
+        GPIO.output(TRIG_PIN, True)
+        time.sleep(0.00001)
+        GPIO.output(TRIG_PIN, False)
+        if debug:
+            print("Trigger sent. Waiting for ECHO high...")
+        # Wait for echo to go high
+        pulse_start = time.time()
+        timeout = pulse_start + 0.01  # Shorter 10ms timeout
+        while GPIO.input(ECHO_PIN) == 0:
+            pulse_start = time.time()
+            if pulse_start > timeout:
+                if debug:
+                    print("Timeout waiting for ECHO high")
+                return -1
+        if debug:
+            print("ECHO high detected. Waiting for low...")
+        # Wait for echo to go low
+        pulse_end = time.time()
+        timeout = pulse_end + 0.01  # Shorter 10ms timeout
+        while GPIO.input(ECHO_PIN) == 1:
+            pulse_end = time.time()
+            if pulse_end > timeout:
+                if debug:
+                    print("Timeout: ECHO never went low (stuck high - no object or wiring issue)")
+                return -1
+        pulse_duration = pulse_end - pulse_start
+        distance = pulse_duration * 17150  # cm
+        if debug:
+            print(f"Pulse duration: {pulse_duration*1e6:.1f} µs")
+            print(f"Distance: {distance} cm")
+        return round(distance, 2)
+    except Exception as e:
+        if debug:
+            print(f"Ultrasonic error: {e}")
+        return -1
+
+from flask_socketio import SocketIO, emit
+import threading
 from api_key import API_KEY
 import io
 import time
@@ -18,17 +86,35 @@ from flask_session import Session  # pip install flask-session
 from folium import Element
 from folium.plugins import MarkerCluster, LocateControl
 
+
 app = Flask(__name__)
 app.secret_key = 'reefscan_secret'  # Change for prod
 app.config['SESSION_TYPE'] = 'filesystem'
 Session(app)
+socketio = SocketIO(app)  # Removed engineio_logger to avoid the TypeError
 
 UPLOAD_FOLDER = 'uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
+
 # Global for demo (use DB later)
 clusters_data = {}  # {session_id: {'blobs': [...], 'start_time': ..., 'deploy_count': 0, ...}}
+
+# --- Real-time ultrasonic sensor thread ---
+ultrasonic_distance = 0.0
+DEPLOY_THRESHOLD = 15.0
+
+def ultrasonic_monitor():
+    global ultrasonic_distance, ULTRASONIC_INITIALIZED
+    while ULTRASONIC_INITIALIZED:
+        dist = get_ultrasonic_distance()
+        ultrasonic_distance = dist
+        # Add callback to queue emit async
+        socketio.emit('ultrasonic_update', {'distance': dist}, callback=lambda: None)
+        if dist > 0 and dist < DEPLOY_THRESHOLD:
+            socketio.emit('deploy_event', {'message': 'Coral sample deployed!', 'distance': dist}, callback=lambda: None)
+        time.sleep(0.05)  # 20Hz polling
 
 def haversine_dist(lat1, lon1, lat2, lon2):
     R = 6371000
@@ -44,6 +130,7 @@ def landing():
 
 @app.route('/new', methods=['GET', 'POST'])
 def new_session():
+    global GPIO, ULTRASONIC_INITIALIZED, ultrasonic_thread
     if request.method == 'POST':
         file = request.files['file']
         if file.filename == '':
@@ -67,6 +154,9 @@ def new_session():
                 cluster_sizes = deploy_df['cluster'].value_counts()
                 valid_clusters = [c for c in cluster_sizes[cluster_sizes >= min_cluster_size].index if c != -1]
                 
+                # Store labeled deploy_df and valid_clusters to avoid recompute
+                labeled_deploy_df = deploy_df.copy()  # Retain labels/sizes
+                
                 # Prep blobs as list of [centre_lat, centre_lon, radius=eps] for JS checks
                 blobs = []
                 for cid in valid_clusters:
@@ -86,10 +176,26 @@ def new_session():
                     'eps': eps,
                     'min_samples': min_samples,
                     'min_cluster_size': min_cluster_size,
-                    'hide_no_deploy': hide_no_deploy
+                    'hide_no_deploy': hide_no_deploy,
+                    'labeled_deploy_df': labeled_deploy_df,
+                    'valid_clusters': valid_clusters
                 }
                 session['session_id'] = session_id
-                
+
+                # --- Ultrasonic sensor initialization ---
+                if not ULTRASONIC_INITIALIZED:
+                    import Jetson.GPIO as _GPIO
+                    GPIO = _GPIO
+                    GPIO.setmode(GPIO.BOARD)
+                    GPIO.setup(TRIG_PIN, GPIO.OUT)
+                    GPIO.setup(ECHO_PIN, GPIO.IN)
+                    GPIO.output(TRIG_PIN, False)
+                    ULTRASONIC_INITIALIZED = True
+                    time.sleep(0.05)
+                    if ultrasonic_thread is None:
+                        ultrasonic_thread = threading.Thread(target=ultrasonic_monitor, daemon=True)
+                        ultrasonic_thread.start()
+
                 return redirect('/dashboard')
             else:
                 return render_template('new.html', error='No deploy (2) points found!')
@@ -129,9 +235,9 @@ def dashboard():
     )
     
     # Add custom style to override Folium's #map with .folium-map for proper sizing
-    m.get_root().header.add_child(Element('<style>.folium-map { position: absolute; top: 0; bottom: 0; right: 0; left: 0; height: 100%; width: 100%; }</style>'))
+    m.get_root().header.add_child(Element('<style>.folium-map { height: 80vh; width: 100%; }</style>'))
     
-    # Show all points directly (no clustering for visibility)
+    # REVERTED: Show all points individually (no MarkerCluster for full visibility)
     points_layer = folium.FeatureGroup(name='Points', show=True)
     
     def get_colour(decision):
@@ -146,36 +252,76 @@ def dashboard():
             popup=f"Patch {row['patch_id']}<br>Decision: {row['patch_decision']}<br>Depth: {row['ping_depth']}",
             color=get_colour(row['patch_decision']), fill=True, fillOpacity=0.7
         )
-        marker.add_to(points_layer)
+        marker.add_to(points_layer)  # CHANGED: Add directly to layer (no mc clustering)
     
     m.add_child(points_layer)
     
-    # Blobs (unchanged)
-    deploy_df = data['df'][data['df']['patch_decision'] == 2].copy()  # Use original df for blobs
-    coords = deploy_df[['patch_lon', 'patch_lat']].values
-    db = DBSCAN(eps=eps / 6371000, min_samples=min_samples, metric='haversine').fit(np.radians(coords))
-    deploy_df['cluster'] = db.labels_
-    cluster_sizes = deploy_df['cluster'].value_counts()
-    valid_clusters = [c for c in cluster_sizes[cluster_sizes >= min_cluster_size].index if c != -1]
+    # OPTIMIZED: Use stored labeled data (no DBSCAN refit)
+    labeled_deploy_df = data['labeled_deploy_df']
+    valid_clusters = data['valid_clusters']
     
+    # Predefined colors for clusters
+    colors = ['red', 'blue', 'green', 'orange', 'purple', 'brown', 'pink', 'gray', 'olive', 'cyan']
+    
+    # Prepare cluster_info for template
+    cluster_info = []
+    for i, cid in enumerate(valid_clusters):
+        color = colors[i % len(colors)]
+        cluster_pts = labeled_deploy_df[labeled_deploy_df['cluster'] == cid][['patch_lat', 'patch_lon']].values
+        size = len(cluster_pts)
+        if size > 0:
+            center_lat, center_lon = cluster_pts.mean(axis=0)
+            # Calc area
+            if size >= 3:
+                hull_input = cluster_pts[:, [1, 0]]  # lon, lat
+                hull = ConvexHull(hull_input)
+                vertices = cluster_pts[hull.vertices]
+                hull_pts = [Point(v[1], v[0]) for v in vertices]  # lat, lon
+                hull_poly = unary_union(hull_pts).convex_hull
+                gdf = gpd.GeoDataFrame({'geometry': [hull_poly]}, crs='EPSG:4326')
+                area_m2 = round(gdf.to_crs('EPSG:3857').area.iloc[0], 2)
+            else:
+                # Approx circle area for small clusters
+                r_m = eps / 2
+                area_m2 = round(np.pi * r_m**2, 2)
+            
+            cluster_info.append({
+                'cid': cid,
+                'size': size,
+                'center_lat': round(float(center_lat), 6),
+                'center_lon': round(float(center_lon), 6),
+                'area_m2': area_m2,
+                'color': color
+            })
+    
+    # Parent layer for all clusters (single toggle in LayerControl)
     clusters_layer = folium.FeatureGroup(name='Clusters (Blobs)', show=True)
-    for cid in valid_clusters:
-        cluster_pts = deploy_df[deploy_df['cluster'] == cid][['patch_lat', 'patch_lon']].values
+    
+    # Add individual cluster layers for toggling
+    for i, cid in enumerate(valid_clusters):
+        color = colors[i % len(colors)]
+        cluster_layer = folium.FeatureGroup(name=f'Cluster {cid}', show=True)
+        cluster_pts = labeled_deploy_df[labeled_deploy_df['cluster'] == cid][['patch_lat', 'patch_lon']].values
         if len(cluster_pts) >= 3:
-            hull_input = cluster_pts[:, [1, 0]]
+            hull_input = cluster_pts[:, [1, 0]]  # lon, lat for ConvexHull
             hull = ConvexHull(hull_input)
             vertices = cluster_pts[hull.vertices]
-            hull_pts = [Point(v[1], v[0]) for v in vertices]
+            hull_pts = [Point(v[1], v[0]) for v in vertices]  # lat, lon for Point
             hull_poly = unary_union(hull_pts).convex_hull
             gdf = gpd.GeoDataFrame({'geometry': [hull_poly]}, crs='EPSG:4326')
+            # Fixed style_function: lambda capturing color
+            style_function = lambda x, col=color: {'fillColor': col, 'color': col, 'weight': 3, 'fillOpacity': 0.4}
             folium.GeoJson(
                 gdf,
-                style_function=lambda x: {'fillColor': 'green', 'color': 'darkgreen', 'weight': 3, 'fillOpacity': 0.4},
+                style_function=style_function,
                 popup=f"Cluster {cid}<br>Size: {len(cluster_pts)} points"
-            ).add_to(clusters_layer)
+            ).add_to(cluster_layer)
         else:
             centre = cluster_pts.mean(axis=0)
-            folium.Circle([centre[0], centre[1]], radius=eps / 50, color='darkgreen', weight=3, fillColor='green', fillOpacity=0.4).add_to(clusters_layer)
+            folium.Circle([centre[0], centre[1]], radius=eps / 111000 * 57.3,  # Approx degrees to meters conversion
+                          color=color, weight=3, fillColor=color, fillOpacity=0.4).add_to(cluster_layer)
+        
+        clusters_layer.add_child(cluster_layer)
     
     m.add_child(clusters_layer)
     folium.LayerControl().add_to(m)
@@ -325,14 +471,89 @@ def dashboard():
     # Stats for dashboard
     start_time = data['start_time']
     mission_time = str(timedelta(seconds=int(time.time() - start_time)))
+    ultrasonic_distance = get_ultrasonic_distance()
     stats = {
         'mission_time': mission_time,
         'deploy_count': data['deploy_count'],
         'total': len(df),
-        'blobs': len(data['blobs'])
+        'blobs': len(cluster_info),
+        'ultrasonic_distance': ultrasonic_distance
     }
+    return render_template('dashboard.html', map_html=map_html, stats=stats, cluster_info=cluster_info)
+
+# API endpoint for live ultrasonic sensor data
+@app.route('/api/ultrasonic')
+def ultrasonic_api():
+    try:
+        distance = get_ultrasonic_distance()
+        return jsonify({'distance': distance})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/download_gpx')
+def download_gpx():
+    if 'session_id' not in session:
+        return redirect('/new')
     
-    return render_template('dashboard.html', map_html=map_html, stats=stats)
+    session_id = session['session_id']
+    data = clusters_data.get(session_id, {})
+    if not data:
+        return redirect('/new')
+    
+    labeled_deploy_df = data['labeled_deploy_df']
+    valid_clusters = data['valid_clusters']
+    
+    # Filter by selected if provided
+    selected_str = request.args.get('selected', None)
+    if selected_str:
+        try:
+            selected = [int(c.strip()) for c in selected_str.split(',') if c.strip()]
+            valid_clusters = [c for c in valid_clusters if c in selected]
+        except ValueError:
+            pass  # Invalid, fall back to all
+    
+    print(f"DEBUG: Starting GPX export for {len(valid_clusters)} clusters (selected: {selected_str})")  # Console log
+    
+    gpx = gpxpy.gpx.GPX()
+    route_count = 0
+    
+    for cid in valid_clusters:
+        try:
+            cluster_pts = labeled_deploy_df[labeled_deploy_df['cluster'] == cid][['patch_lat', 'patch_lon']].values  # [lat, lon]
+            route_name = f"Cluster {cid} (size: {len(cluster_pts)})"
+            route = gpxpy.gpx.GPXRoute(name=route_name, description=f"Convex hull boundary for cluster {cid}")
+            
+            if len(cluster_pts) >= 3:
+                hull_input = cluster_pts[:, [1, 0]]  # [lon, lat] for ConvexHull
+                hull = ConvexHull(hull_input)
+                ordered_cluster_pts = cluster_pts[hull.vertices]  # ordered [lat, lon]
+                for lat, lon in ordered_cluster_pts:
+                    rtept = gpxpy.gpx.GPXRoutePoint(latitude=lat, longitude=lon)
+                    route.points.append(rtept)
+                # Close the route for a polygon-like boundary
+                if len(route.points) > 0:
+                    route.points.append(route.points[0])
+            else:
+                # For small clusters, add all points (no hull)
+                for lat, lon in cluster_pts:
+                    rtept = gpxpy.gpx.GPXRoutePoint(latitude=lat, longitude=lon)
+                    route.points.append(rtept)
+            
+            gpx.routes.append(route)
+            route_count += 1
+            print(f"DEBUG: Added route for cluster {cid} ({len(route.points)} points)")
+        except Exception as e:
+            print(f"DEBUG: Skipped cluster {cid} due to error: {e}")
+            continue  # Skip bad cluster but continue with others
+    
+    print(f"DEBUG: GPX export complete with {route_count} routes")  # Final log
+    
+    xml = gpx.to_xml()
+    return Response(
+        xml,
+        mimetype="application/gpx+xml",
+        headers={"Content-disposition": "attachment; filename=clusters.gpx"}
+    )
 
 @app.route('/end_session')
 def end_session():
@@ -432,4 +653,12 @@ def handle_error(error):
     return response
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    try:
+        # Set log_output=True to show the server address (and other startup info)
+        socketio.run(app, debug=True, log_output=True)
+    finally:
+        try:
+            GPIO.cleanup()
+            print("GPIO cleaned up on shutdown.")
+        except:
+            pass

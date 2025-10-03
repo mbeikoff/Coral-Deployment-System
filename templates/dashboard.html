@@ -5,7 +5,7 @@
     <title>ReefScan - Dashboard</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
-        #status-box { position: absolute; top: 10px; left: 10px; z-index: 1000; width: 350px; font-size: 1.1em; }
+        #status-box { position: relative; z-index: 1000; width: 100%; font-size: 1.1em; margin-bottom: 1rem; }
         .status-deploy { background: green; color: white; }
         .status-no-deploy { background: red; color: white; }
         .readout { font-size: 1em; margin: 5px 0; }
@@ -23,20 +23,62 @@
             border-top: 1px solid #dee2e6;
             box-shadow: 0 -2px 5px rgba(0,0,0,0.1);
         }
+        #cluster-panel {
+            max-height: 60vh;
+            overflow-y: auto;
+            border: 1px solid #dee2e6;
+        }
+        .cluster-badge {
+            width: 20px;
+            height: 20px;
+            display: inline-block;
+            border-radius: 50%;
+            margin-right: 8px;
+            vertical-align: middle;
+        }
+        #download-selected {
+            display: block;
+        }
+        #download-selected.hidden {
+            display: none;
+        }
     </style>
 </head>
 <body>
     <div class="container-fluid">
-        <div id="status-box" class="p-4 rounded shadow status-no-deploy">
-            <h3 id="status-text">DON'T DEPLOY</h3>
-            <div class="readout"><strong>Mission Time:</strong> <span id="mission-time">{{ stats.mission_time }}</span></div>
-            <div class="readout"><strong>Total Deployments:</strong> <span id="deploy-count">{{ stats.deploy_count }}</span></div>
-            <div class="readout"><strong>GPS Position:</strong> <span id="gps-pos">Loading...</span></div>
-            <div class="readout"><strong>Distance Travelled:</strong> <span id="distance">0 km</span></div>
-            <div class="readout"><strong>Speed:</strong> <span id="speed">0 km/h</span></div>
-            <div class="readout"><strong>Depth:</strong> <span id="depth">20 m</span></div>
+        <div class="row">
+            <div class="col-md-3">
+                <div id="status-box" class="p-4 rounded shadow status-no-deploy">
+                    <h3 id="status-text">DON'T DEPLOY</h3>
+                    <div class="readout"><strong>Mission Time:</strong> <span id="mission-time">{{ stats.mission_time }}</span></div>
+                    <div class="readout"><strong>Total Deployments:</strong> <span id="deploy-count">{{ stats.deploy_count }}</span></div>
+                    <div class="readout"><strong>GPS Position:</strong> <span id="gps-pos">Loading...</span></div>
+                    <div class="readout"><strong>Distance Travelled:</strong> <span id="distance">0 km</span></div>
+                    <div class="readout"><strong>Speed:</strong> <span id="speed">0 km/h</span></div>
+                    <div class="readout"><strong>Depth:</strong> <span id="depth">20 m</span></div>
+                    <div class="readout"><strong>Ultrasonic Distance:</strong> <span id="ultrasonic-distance">{{ stats.ultrasonic_distance }} cm</span></div>
+                </div>
+                <div id="cluster-panel" class="p-3 bg-light rounded">
+                    <h6>Clusters ({{ stats.blobs }})</h6>
+                    <ul id="cluster-list" class="list-unstyled">
+                        {% for info in cluster_info %}
+                        <li class="mb-2 form-check">
+                            <input class="form-check-input cluster-check" type="checkbox" data-cid="{{ info.cid }}" checked id="check-{{ info.cid }}">
+                            <label class="form-check-label" for="check-{{ info.cid }}">
+                                <span class="cluster-badge" style="background-color: {{ info.color }};"></span>
+                                Cluster {{ info.cid }} ({{ info.size }} pts)
+                                <br><small class="text-muted">Center: {{ info.center_lat }}, {{ info.center_lon }} | Area: {{ info.area_m2 }} m²</small>
+                            </label>
+                        </li>
+                        {% endfor %}
+                    </ul>
+                    <button id="download-selected" class="btn btn-success btn-sm w-100">Download Selected GPX</button>
+                </div>
+            </div>
+            <div class="col-md-9">
+                <div id="map-container">{{ map_html | safe }}</div>
+            </div>
         </div>
-        <div id="map-container">{{ map_html | safe }}</div>
         <div class="fixed-bottom-row">
             <div class="container">
                 <div class="row">
@@ -51,7 +93,103 @@
             </div>
         </div>
     </div>
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <script>
+    // Connect to Socket.IO
+    var socket = io();
+    socket.on('ultrasonic_update', function(data) {
+        var el = document.getElementById('ultrasonic-distance');
+        if (el && data.distance !== undefined) {
+            el.textContent = data.distance + ' cm';
+        }
+    });
+    socket.on('deploy_event', function(data) {
+        // Show info popup for deploy event
+        var popup = document.createElement('div');
+        popup.style.position = 'fixed';
+        popup.style.top = '20px';
+        popup.style.left = '50%';
+        popup.style.transform = 'translateX(-50%)';
+        popup.style.background = '#17a2b8';
+        popup.style.color = 'white';
+        popup.style.padding = '16px 32px';
+        popup.style.borderRadius = '8px';
+        popup.style.zIndex = 2000;
+        popup.style.fontSize = '1.3em';
+        popup.innerHTML = '<strong>' + data.message + '</strong><br>Distance: ' + data.distance + ' cm';
+        document.body.appendChild(popup);
+        setTimeout(function() {
+            popup.remove();
+        }, 2500);
+    });
 
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+    // Cluster selection and toggle JS (runs after DOM ready)
+    document.addEventListener('DOMContentLoaded', function() {
+        const checks = document.querySelectorAll('.cluster-check');
+        const downloadBtn = document.getElementById('download-selected');
+
+        function updateDownloadButton() {
+            const selected = Array.from(checks).filter(c => c.checked).length;
+            if (selected > 0) {
+                downloadBtn.classList.remove('hidden');
+            } else {
+                downloadBtn.classList.add('hidden');
+            }
+        }
+
+        // Initial check
+        updateDownloadButton();
+
+        // Wait for map to load before attaching toggles
+        const mapCheckInterval = setInterval(function() {
+            if (window.map) {
+                clearInterval(mapCheckInterval);
+                attachToggleListeners();
+            }
+        }, 200);
+
+        function attachToggleListeners() {
+            checks.forEach(function(check) {
+                check.addEventListener('change', function() {
+                    const cid = this.dataset.cid;
+                    const checked = this.checked;
+                    // Recursive toggle function
+                    function findAndToggle(layer) {
+                        if (layer.options && layer.options.name === `Cluster ${cid}`) {
+                            if (checked) {
+                                window.map.addLayer(layer);
+                            } else {
+                                window.map.removeLayer(layer);
+                            }
+                            return true;
+                        }
+                        if (layer.getLayers && layer.getLayers().length > 0) {
+                            for (let child of layer.getLayers()) {
+                                if (findAndToggle(child)) return true;
+                            }
+                        }
+                        return false;
+                    }
+                    window.map.eachLayer(findAndToggle);
+                    updateDownloadButton();
+                });
+            });
+        }
+
+        // Download handler
+        downloadBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            const selected = Array.from(checks).filter(c => c.checked)
+                .map(c => c.dataset.cid)
+                .join(',');
+            if (selected === '') {
+                alert('Please select at least one cluster to download.');
+                return;
+            }
+            // Trigger download via query param
+            window.location.href = `/download_gpx?selected=${selected}`;
+        });
+    });
+    </script>
 </body>
 </html>
