@@ -126,6 +126,16 @@ See `requirements.txt` for all dependencies. Main packages:
 - For ultrasonic sensor issues, ensure your hardware is connected and Jetson.GPIO is installed.
 - If the dashboard freezes, ensure only one ultrasonic thread is running and the app is started with `eventlet` monkey patching.
 
+## Jetson GPIO Pin Setup
+
+If you are running on Jetson hardware, you must configure the TRIG pin as an output before running the app. Run the following command in your terminal:
+
+```bash
+sudo busybox devmem 0x2448030 w 0xA
+```
+
+This sets the TRIG GPIO pin to output mode (required for HC-SR04 operation).
+
 ---
 
 For more details, see comments in `app.py` or open an issue.
