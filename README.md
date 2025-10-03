@@ -134,7 +134,7 @@ If you are running on Jetson hardware, you must configure the TRIG pin as an out
 sudo busybox devmem 0x2448030 w 0xA
 ```
 
-This sets the TRIG GPIO pin to output mode (required for HC-SR04 operation).
+This sets the TRIG GPIO pin to output mode ( required for HC-SR04 operation).
 
 ---
 
