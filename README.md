@@ -8,12 +8,18 @@
     cd Coral-Deployment-System
     ```
 
-2. **Build the Docker image:**
+2. **Set up your MapTiler API key:**
+    ```bash
+    python3 api_key_template.py
+    ```
+    Follow the prompt to enter your API key. This will create an `api_key.py` file (which is git-ignored).
+
+3. **Build the Docker image:**
     ```bash
     docker build -t coraldeploy-local -f docker/Dockerfile .
     ```
 
-3. **Run the Docker container:**
+4. **Run the Docker container:**
     ```bash
     sudo docker run -it --rm \
       --runtime=nvidia --gpus all \
@@ -29,14 +35,22 @@
     ```
     Adjust volume mounts as needed for your outputs/uploads.
 
-4. **Set up your MapTiler API key:**
+5. **Open your browser and go to:**
+    [http://127.0.0.1:5000](http://127.0.0.1:5000)
+
+---
+
+## IMPORTANT: API Key Setup Before Building Docker
+
+Before building the Docker container, you must set up your MapTiler API key. This ensures the container has access to the required API key for map tiles.
+
+1. Run the following command in your project directory:
     ```bash
     python3 api_key_template.py
     ```
-    Follow the prompt to enter your API key. This will create an `api_key.py` file (which is git-ignored).
+2. Enter your MapTiler API key when prompted. This will create an `api_key.py` file (which is git-ignored).
 
-5. **Open your browser and go to:**
-    [http://127.0.0.1:5000](http://127.0.0.1:5000)
+**Only after this step should you proceed to build the Docker image.**
 
 ---
 
