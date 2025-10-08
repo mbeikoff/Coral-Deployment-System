@@ -139,17 +139,36 @@ This app uses MapTiler for satellite map tiles. You must provide your own MapTil
 
 ## Running the App
 
-1. Install Python 3 and pip if not already installed.
-2. Install dependencies:
+You can run the Coral Deployment System in two ways:
+
+### 1. Through Docker (Recommended for Production)
+
+- This is the preferred method for production deployments.
+- All dependencies and hardware access are managed inside the container.
+- Follow the Docker build and run instructions above.
+
+### 2. Standalone (Recommended for Development)
+
+- Useful for development, debugging, or rapid iteration.
+- You must manually install all dependencies:
     ```bash
     pip install -r requirements.txt
     ```
-3. Set up your API key as above.
-4. Start the app:
+- You must run the app with `sudo` to access GPIO hardware:
     ```bash
-    python3 app.py
+    sudo python3 app.py
     ```
-5. Open your browser to [http://127.0.0.1:5000](http://127.0.0.1:5000)
+- Before starting, set up the GPIO pin for the ultrasonic sensor:
+    ```bash
+    sudo busybox devmem 0x2448030 w 0xA
+    ```
+    (This command configures the TRIG pin as output. The setup code is now located in `flask_session/gpio_setup.py`.)
+- Make sure your MapTiler API key is set up by running:
+    ```bash
+    python3 api_key_template.py
+    ```
+
+**Note:** For production use, always run the app through Docker to ensure consistent environment and hardware access. Standalone mode is best for local development and testing.
 
 ## Using the Web App
 
