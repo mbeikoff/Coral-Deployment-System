@@ -12,6 +12,8 @@ from shapely.ops import unary_union
 from scipy.spatial import ConvexHull
 import geopandas as gpd
 import os
+import serial
+import pynmea2
 
 # pip install gpxpy  # Add this for GPX export
 import gpxpy
@@ -84,7 +86,8 @@ import json
 from datetime import datetime, timedelta
 from flask_session import Session  # pip install flask-session
 from folium import Element
-from folium.plugins import MarkerCluster, LocateControl
+from folium.plugins import MarkerCluster, LocateControl, Realtime
+from folium import JsCode
 
 
 app = Flask(__name__)
@@ -101,19 +104,24 @@ app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 # Global for demo (use DB later)
 clusters_data = {}  # {session_id: {'blobs': [...], 'start_time': ..., 'deploy_count': 0, ...}}
 
+CURRENT_SESSION_ID = None
+CURRENT_IN_ZONE = False
+
 # --- Real-time ultrasonic sensor thread ---
 ultrasonic_distance = 0.0
 DEPLOY_THRESHOLD = 15.0
 
 def ultrasonic_monitor():
-    global ultrasonic_distance, ULTRASONIC_INITIALIZED
+    global ultrasonic_distance, ULTRASONIC_INITIALIZED, CURRENT_SESSION_ID, CURRENT_IN_ZONE
     while ULTRASONIC_INITIALIZED:
         dist = get_ultrasonic_distance()
         ultrasonic_distance = dist
         # Add callback to queue emit async
         socketio.emit('ultrasonic_update', {'distance': dist}, callback=lambda: None)
-        if dist > 0 and dist < DEPLOY_THRESHOLD:
-            socketio.emit('deploy_event', {'message': 'Coral sample deployed!', 'distance': dist}, callback=lambda: None)
+        if dist > 0 and dist < DEPLOY_THRESHOLD and CURRENT_IN_ZONE and CURRENT_SESSION_ID in clusters_data:
+            sess_data = clusters_data[CURRENT_SESSION_ID]
+            sess_data['deploy_count'] += 1
+            socketio.emit('deploy_event', {'message': 'Coral sample deployed!', 'distance': dist, 'deploy_count': sess_data['deploy_count']}, callback=lambda: None)
         time.sleep(0.05)  # 20Hz polling
 
 def haversine_dist(lat1, lon1, lat2, lon2):
@@ -130,7 +138,7 @@ def landing():
 
 @app.route('/new', methods=['GET', 'POST'])
 def new_session():
-    global GPIO, ULTRASONIC_INITIALIZED, ultrasonic_thread
+    global GPIO, ULTRASONIC_INITIALIZED, ultrasonic_thread, CURRENT_SESSION_ID, CURRENT_IN_ZONE
     if request.method == 'POST':
         file = request.files['file']
         if file.filename == '':
@@ -181,6 +189,8 @@ def new_session():
                     'valid_clusters': valid_clusters
                 }
                 session['session_id'] = session_id
+                CURRENT_SESSION_ID = session_id
+                CURRENT_IN_ZONE = False
 
                 # --- Ultrasonic sensor initialization ---
                 if not ULTRASONIC_INITIALIZED:
@@ -294,10 +304,7 @@ def dashboard():
                 'color': color
             })
     
-    # Parent layer for all clusters (single toggle in LayerControl)
-    clusters_layer = folium.FeatureGroup(name='Clusters (Blobs)', show=True)
-    
-    # Add individual cluster layers for toggling
+    # Add individual cluster layers directly to map (no parent for clean toggling)
     for i, cid in enumerate(valid_clusters):
         color = colors[i % len(colors)]
         cluster_layer = folium.FeatureGroup(name=f'Cluster {cid}', show=True)
@@ -321,150 +328,40 @@ def dashboard():
             folium.Circle([centre[0], centre[1]], radius=eps / 111000 * 57.3,  # Approx degrees to meters conversion
                           color=color, weight=3, fillColor=color, fillOpacity=0.4).add_to(cluster_layer)
         
-        clusters_layer.add_child(cluster_layer)
+        cluster_layer.add_to(m)  # Add directly to map
     
-    m.add_child(clusters_layer)
     folium.LayerControl().add_to(m)
     
-    # Add LocateControl for reliable auto geolocation
-    locate = LocateControl(
-        auto_start=True,  # Start on map load
-        strings={'title': 'Show me where I am', 'popup': 'You are within {distance} {unit} from this point'},
-        locate_options={
-            'watch': True,  # Use watchPosition for continuous updates
-            'setView': 'always',  # Auto-pan/zoom on each update
-            'enableHighAccuracy': True,
-            'timeout': 10000,
-            'maximumAge': 0
-        },
-        keepCurrentZoomLevel=False,
-        returnToPrevBounds=False,
-        showPopup=True
-    )
-    locate.add_to(m)
+    # Add leaflet-realtime for GPS marker
+    dummy_source = JsCode("""
+        function(responseHandler, errorHandler) {
+            // Dummy initial response
+            responseHandler({type: 'FeatureCollection', features: []});
+        }
+    """)
     
-    # Setup JS to assign the dynamic map var to window.map
-    setup_code = """
-    (function() {
-        var checkExist = setInterval(function() {
-            var mapKeys = Object.keys(window).filter(function(k) { return k.indexOf('map_') === 0; });
-            if (mapKeys.length > 0) {
-                window.map = window[mapKeys[0]];
-                clearInterval(checkExist);
-                console.log('Map instance assigned to window.map');
+    rt = Realtime(
+        dummy_source,
+        start=False,
+        get_feature_id=JsCode("(f) => { return f.properties.id; }"),
+        point_to_layer=JsCode("""
+            function(feature, latlng) {
+                return L.marker(latlng, {
+                    icon: L.divIcon({
+                        className: 'gps-marker',
+                        html: '<div style="background: blue; width: 12px; height: 12px; border-radius: 50%; border: 2px solid white; box-shadow: 0 0 5px rgba(0,0,255,0.5);"></div>'
+                    })
+                }).bindPopup('Current GPS Position');
             }
-        }, 100);
-    })();
-    """
-    m.get_root().script.add_child(Element(setup_code))
+        """)
+    )
+    rt.add_to(m)
     
-    # Custom JS for proximity checks, UI updates, API calls (hook into locationfound event) - now uses window.map
-    blobs_json = json.dumps(data['blobs'])
-    eps_str = str(eps)
-    js_code = f"""
-    let blobs = {blobs_json};
-    let eps = {eps_str};
-    let prevPos = null;
-    let totalDistance = 0;
-    
-    function haversineDist(lat1, lon1, lat2, lon2) {{
-        const R = 6371;
-        const dlat = (lat2 - lat1) * Math.PI / 180;
-        const dlon = (lon2 - lon1) * Math.PI / 180;
-        const a = Math.sin(dlat/2) * Math.sin(dlat/2) + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dlon/2) * Math.sin(dlon/2);
-        const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
-        return R * c * 1000; // meters
-    }}
-    
-    // Wait a bit more for window.map to be set, then attach listeners
-    setTimeout(function() {{
-        if (window.map) {{
-            // Listen to locationfound event from LocateControl (fires on each update)
-            window.map.on('locationfound', function(e) {{
-                console.log('Location found:', e.latlng.lat, e.latlng.lng);  // Debug log
-                const lat = e.latlng.lat;
-                const lon = e.latlng.lng;
-                const parentDoc = window.parent.document;
-                parentDoc.getElementById('gps-pos').textContent = `${{lat.toFixed(6)}}, ${{lon.toFixed(6)}}`;
-                
-                // Check nearest blob
-                let minDist = Infinity;
-                blobs.forEach(blob => {{
-                    const dist = haversineDist(lat, lon, blob.lat, blob.lon);
-                    if (dist < minDist) minDist = dist;
-                }});
-                
-                const inZone = minDist <= eps;
-                const statusBox = parentDoc.getElementById('status-box');
-                const statusText = parentDoc.getElementById('status-text');
-                statusBox.className = `p-4 rounded shadow ${{inZone ? 'status-deploy' : 'status-no-deploy'}}`;
-                statusText.textContent = inZone ? 'DEPLOY' : "DON'T DEPLOY";
-                
-                // Distance
-                if (prevPos) {{
-                    const delta = haversineDist(lat, lon, prevPos.lat, prevPos.lon) / 1000;
-                    totalDistance += delta;
-                }}
-                prevPos = {{ lat, lon }};
-                
-                // Speed (placeholder; plugin doesn't provide, use last known or 0)
-                parentDoc.getElementById('speed').textContent = '0.0 km/h';  // Update if speed available
-                
-                // Send to backend
-                fetch('/api/update_gps', {{
-                    method: 'POST',
-                    headers: {{'Content-Type': 'application/json'}},
-                    body: JSON.stringify({{ lat, lon, speed: 0, deployed: false }})
-                }}).then(r => {{
-                    if (!r.ok) {{
-                        throw new Error(`HTTP ${{r.status}}: ${{r.statusText}}`);
-                    }}
-                    return r.json();
-                }}).then(data => {{
-                    parentDoc.getElementById('deploy-count').textContent = data.deploy_count;
-                    parentDoc.getElementById('depth').textContent = `${{data.depth}} m`;
-                    parentDoc.getElementById('distance').textContent = `${{data.total_distance.toFixed(2)}} km`;
-                }}).catch(err => {{
-                    console.error('API Error:', err);
-                    // Fallback to local distance
-                    parentDoc.getElementById('distance').textContent = `${{totalDistance.toFixed(2)}} km`;
-                }});
-                
-                // Optional: Add custom trail (plugin has its own marker)
-                if (!window.gpsTrail) {{
-                    window.gpsTrail = L.polyline([], {{color: '#3388ff', weight: 4, opacity: 0.8}}).addTo(window.map);
-                }}
-                window.gpsTrail.addLatLng([lat, lon]);
-            }});
-            
-            // Error handler for geolocation (e.g., permission denied)
-            window.map.on('locationerror', function(e) {{
-                console.error('Location error:', e.message);
-                window.parent.document.getElementById('gps-pos').textContent = 'Location Error: ' + e.message;
-            }});
-            
-            console.log('Custom event listeners attached to map');
-        }} else {{
-            console.error('window.map not found!');
-        }}
-    }}, 1000);  // Increased delay to ensure setup_code has run and DOM is ready
-    
-    // Mission time update (moved outside timeout for immediate start)
-    setInterval(() => {{
-        fetch('/api/mission_time').then(r => {{
-            if (!r.ok) {{
-                throw new Error(`HTTP ${{r.status}}: ${{r.statusText}}`);
-            }}
-            return r.json();
-        }}).then(data => {{
-            window.parent.document.getElementById('mission-time').textContent = data.time;
-        }}).catch(err => {{
-            console.error('Time API Error:', err);
-        }});
-    }}, 1000);
-    """
-    
-    m.get_root().script.add_child(Element(js_code))
+    # Assign realtime and map to window
+    map_name = m.get_name()
+    rt_name = rt.get_name()
+    m.get_root().script.add_child(Element(f"window.map = {map_name}; console.log('Map assigned to window.map');"))
+    m.get_root().script.add_child(Element(f"window.realtime = {rt_name}; console.log('Realtime assigned to window.realtime');"))
     
     map_html = m._repr_html_()
     
@@ -557,10 +454,13 @@ def download_gpx():
 
 @app.route('/end_session')
 def end_session():
+    global CURRENT_SESSION_ID, CURRENT_IN_ZONE
     if 'session_id' in session:
         session_id = session['session_id']
         data = clusters_data.pop(session_id, None)
         session.pop('session_id')
+        CURRENT_SESSION_ID = None
+        CURRENT_IN_ZONE = False
         if data:
             final_stats = {
                 'mission_time': str(timedelta(seconds=int(time.time() - data['start_time']))),
@@ -651,6 +551,96 @@ def handle_error(error):
     response = jsonify({'error': str(error)})
     response.status_code = error.code if hasattr(error, 'code') else 500
     return response
+
+# --- GPS setup ---
+SERIAL_PORT = '/dev/ttyUSB0'  # Update if needed
+BAUD_RATE = 115200
+TIMEOUT = 1
+MIN_QUAL = 2  # >=2: DGPS/RTK
+
+gps_lat = None
+gps_lon = None
+latest_gps = None
+
+def gps_monitor():
+    global gps_lat, gps_lon, latest_gps, CURRENT_IN_ZONE, CURRENT_SESSION_ID
+    try:
+        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=TIMEOUT)
+    except Exception as e:
+        print(f"GPS serial error: {e}")
+        return
+    print("Starting GPS monitor thread...")
+    while True:
+        try:
+            raw_line = ser.readline()
+            if raw_line:
+                try:
+                    line = raw_line.decode('ascii', errors='replace').strip()
+                    if line.startswith('$GNGGA') or line.startswith('$GGA'):
+                        msg = pynmea2.parse(line)
+                        if isinstance(msg, pynmea2.GGA):
+                            qual = int(msg.gps_qual)
+                            if qual >= MIN_QUAL and msg.latitude and msg.longitude:
+                                gps_lat = msg.latitude
+                                gps_lon = msg.longitude
+                                hdop = float(msg.horizontal_dil) if msg.horizontal_dil else None
+                                sats = int(msg.num_sats) if msg.num_sats else 0
+                                emit_data = {
+                                    'lat': gps_lat,
+                                    'lon': gps_lon,
+                                    'qual': qual,
+                                    'sats': sats,
+                                    'hdop': hdop
+                                }
+                                if CURRENT_SESSION_ID and CURRENT_SESSION_ID in clusters_data:
+                                    sess_data = clusters_data[CURRENT_SESSION_ID]
+                                    # Calc distance to nearest blob
+                                    min_dist = float('inf')
+                                    for blob in sess_data['blobs']:
+                                        dist = haversine_dist(gps_lat, gps_lon, blob['lat'], blob['lon'])
+                                        min_dist = min(min_dist, dist)
+                                    
+                                    in_deploy_zone = min_dist <= sess_data.get('eps', 50.0)
+                                    
+                                    # Update distance travelled
+                                    if sess_data['prev_pos']:
+                                        prev_lat, prev_lon = sess_data['prev_pos']
+                                        dist_delta = haversine_dist(gps_lat, gps_lon, prev_lat, prev_lon) / 1000  # km
+                                        sess_data['total_distance'] += dist_delta
+                                    sess_data['prev_pos'] = (gps_lat, gps_lon)
+                                    
+                                    CURRENT_IN_ZONE = in_deploy_zone
+                                    
+                                    emit_data.update({
+                                        'status': 'DEPLOY' if in_deploy_zone else "DON'T DEPLOY",
+                                        'color': 'green' if in_deploy_zone else 'red',
+                                        'min_dist': min_dist,
+                                        'total_distance': sess_data['total_distance'],
+                                        'deploy_count': sess_data['deploy_count'],
+                                        'speed': 0,
+                                        'depth': 20.0
+                                    })
+                                else:
+                                    emit_data.update({
+                                        'status': 'NO GPS SESSION',
+                                        'color': 'gray',
+                                        'min_dist': None,
+                                        'total_distance': 0,
+                                        'deploy_count': 0,
+                                        'speed': 0,
+                                        'depth': 0
+                                    })
+                                socketio.emit('gps_position_update', emit_data)
+                except Exception as e:
+                    print(f"GPS parse error: {e}")
+            time.sleep(0.1)
+        except Exception as e:
+            print(f"GPS read error: {e}")
+            time.sleep(1)
+
+# Start GPS monitor thread automatically
+import threading
+threading.Thread(target=gps_monitor, daemon=True).start()
 
 if __name__ == '__main__':
     try:

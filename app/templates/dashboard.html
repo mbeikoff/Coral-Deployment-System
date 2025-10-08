@@ -8,6 +8,7 @@
         #status-box { position: relative; z-index: 1000; width: 100%; font-size: 1.1em; margin-bottom: 1rem; }
         .status-deploy { background: green; color: white; }
         .status-no-deploy { background: red; color: white; }
+        .status-no-session { background: gray; color: white; }
         .readout { font-size: 1em; margin: 5px 0; }
         .folium-map { height: 80vh; width: 100%; } /* Target .folium-map for sizing */
         h3 { font-size: 1.5em; margin-bottom: 10px; }
@@ -42,6 +43,10 @@
         #download-selected.hidden {
             display: none;
         }
+        .gps-marker {
+            background: transparent;
+            border: none;
+        }
     </style>
 </head>
 <body>
@@ -53,6 +58,7 @@
                     <div class="readout"><strong>Mission Time:</strong> <span id="mission-time">{{ stats.mission_time }}</span></div>
                     <div class="readout"><strong>Total Deployments:</strong> <span id="deploy-count">{{ stats.deploy_count }}</span></div>
                     <div class="readout"><strong>GPS Position:</strong> <span id="gps-pos">Loading...</span></div>
+                    <div class="readout"><strong>GPS Status:</strong> <span id="gps-status">Acquiring...</span></div>
                     <div class="readout"><strong>Distance Travelled:</strong> <span id="distance">0 km</span></div>
                     <div class="readout"><strong>Speed:</strong> <span id="speed">0 km/h</span></div>
                     <div class="readout"><strong>Depth:</strong> <span id="depth">20 m</span></div>
@@ -95,14 +101,56 @@
     </div>
     <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
     <script>
-    // Connect to Socket.IO
+    // Connect to Socket.IO early for immediate event reception
+    console.log('Connecting to Socket.IO...');
     var socket = io();
+    socket.on('connect', function() {
+        console.log('Socket.IO connected!');
+    });
+    socket.on('disconnect', function() {
+        console.log('Socket.IO disconnected!');
+    });
+
+    // Store latest GPS for optional replay on map ready
+    window.latestGps = null;
+
+    // Helper to update map (extracted for reuse)
+    function updateMapWithGps(data) {
+        if (window.map && window.realtime) {
+            // Update realtime marker with GeoJSON (note: GeoJSON coords are [lon, lat])
+            var geojson = {
+                type: 'FeatureCollection',
+                features: [{
+                    type: 'Feature',
+                    geometry: {type: 'Point', coordinates: [data.lon, data.lat]},
+                    properties: {id: 'gps'}
+                }]
+            };
+            window.realtime.update(geojson);
+
+            // Lazy init trail and add point (Leaflet LatLng is [lat, lon])
+            if (!window.gpsTrail) {
+                window.gpsTrail = L.polyline([], {color: '#3388ff', weight: 4, opacity: 0.8}).addTo(window.map);
+                console.log('GPS trail initialized');
+            }
+            window.gpsTrail.addLatLng([data.lat, data.lon]);
+
+            // Auto-pan to new position
+            window.map.panTo([data.lat, data.lon], {animate: true, duration: 0.5});
+        } else {
+            console.log('Map or realtime not ready yet for GPS update');
+        }
+    }
+
+    // Ultrasonic update (independent of DOM/map)
     socket.on('ultrasonic_update', function(data) {
         var el = document.getElementById('ultrasonic-distance');
         if (el && data.distance !== undefined) {
             el.textContent = data.distance + ' cm';
         }
     });
+
+    // Deploy event (independent)
     socket.on('deploy_event', function(data) {
         // Show info popup for deploy event
         var popup = document.createElement('div');
@@ -121,10 +169,57 @@
         setTimeout(function() {
             popup.remove();
         }, 2500);
+        if (data.deploy_count !== undefined) {
+            document.getElementById('deploy-count').textContent = data.deploy_count;
+        }
     });
+
+    // GPS position update - update UI always, map when ready
+    socket.on('gps_position_update', function(data) {
+        window.latestGps = data;  // Store for replay if map becomes ready later
+        if (data.lat !== undefined && data.lon !== undefined) {
+            // Always update UI elements immediately
+            document.getElementById('gps-pos').textContent = data.lat.toFixed(6) + ', ' + data.lon.toFixed(6);
+            document.getElementById('gps-status').textContent = `Qual: ${data.qual}, Sats: ${data.sats}, HDOP: ${data.hdop ? data.hdop.toFixed(2) : 'N/A'}`;
+            const statusBox = document.getElementById('status-box');
+            const statusText = document.getElementById('status-text');
+            let statusClass = 'status-no-deploy';
+            if (data.color === 'green') {
+                statusClass = 'status-deploy';
+            } else if (data.color === 'red') {
+                statusClass = 'status-no-deploy';
+            } else if (data.color === 'gray') {
+                statusClass = 'status-no-session';
+            }
+            statusBox.className = `p-4 rounded shadow ${statusClass}`;
+            statusText.textContent = data.status;
+            document.getElementById('deploy-count').textContent = data.deploy_count;
+            document.getElementById('depth').textContent = `${data.depth} m`;
+            document.getElementById('distance').textContent = `${data.total_distance.toFixed(2)} km`;
+            document.getElementById('speed').textContent = `${data.speed.toFixed(1)} km/h`;
+
+            // Map updates only if map is ready
+            updateMapWithGps(data);
+        }
+    });
+
+    // Mission time update (independent)
+    setInterval(() => {
+        fetch('/api/mission_time').then((r) => {
+            if (!r.ok) {
+                throw new Error(`HTTP ${r.status}: ${r.statusText}`);
+            }
+            return r.json();
+        }).then(data => {
+            document.getElementById('mission-time').textContent = data.time;
+        }).catch(err => {
+            console.error('Time API Error:', err);
+        });
+    }, 1000);
 
     // Cluster selection and toggle JS (runs after DOM ready)
     document.addEventListener('DOMContentLoaded', function() {
+        console.log('DOM loaded');
         const checks = document.querySelectorAll('.cluster-check');
         const downloadBtn = document.getElementById('download-selected');
 
@@ -132,8 +227,10 @@
             const selected = Array.from(checks).filter(c => c.checked).length;
             if (selected > 0) {
                 downloadBtn.classList.remove('hidden');
+                downloadBtn.disabled = false;
             } else {
                 downloadBtn.classList.add('hidden');
+                downloadBtn.disabled = true;
             }
         }
 
@@ -144,6 +241,7 @@
         const mapCheckInterval = setInterval(function() {
             if (window.map) {
                 clearInterval(mapCheckInterval);
+                console.log('Map loaded, attaching toggles');
                 attachToggleListeners();
             }
         }, 200);

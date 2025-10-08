@@ -8,38 +8,107 @@
     cd Coral-Deployment-System
     ```
 
-2. **Install dependencies:**
+2. **Build the Docker image:**
     ```bash
-    pip install -r requirements.txt
+    docker build -t coraldeploy-local -f docker/Dockerfile .
     ```
 
-3. **Set up your MapTiler API key:**
+3. **Run the Docker container:**
+    ```bash
+    sudo docker run -it --rm \
+      --runtime=nvidia --gpus all \
+      --network=host --privileged \
+      --device=/dev/gpiochip0 --device=/dev/gpiochip1 --device=/dev/gpiochip2 \
+      -v /proc/device-tree/compatible:/proc/device-tree/compatible \
+      -v /proc/device-tree/chosen:/proc/device-tree/chosen \
+      -v /sys/devices/:/sys/devices/ \
+      -v /sys/firmware/devicetree:/sys/firmware/devicetree \
+      -v $PWD/output:/app/output \
+      -e JETSON_MODEL_NAME=JETSON_ORIN_NANO \
+      coraldeploy-local
+    ```
+    Adjust volume mounts as needed for your outputs/uploads.
+
+4. **Set up your MapTiler API key:**
     ```bash
     python3 api_key_template.py
     ```
     Follow the prompt to enter your API key. This will create an `api_key.py` file (which is git-ignored).
-
-4. **Run the web application:**
-    ```bash
-    python3 app.py
-    ```
 
 5. **Open your browser and go to:**
     [http://127.0.0.1:5000](http://127.0.0.1:5000)
 
 ---
 
+## Docker Installation (Required Version)
+
+This project requires Docker version **27.5.1** and containerd **1.7.24** for full compatibility with Jetson hardware and GPIO access. Follow these steps to install the correct Docker version:
+
+1. **Clean up any existing Docker installation:**
+    ```bash
+    sudo systemctl stop docker docker.socket containerd
+    sudo apt-get purge -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    sudo apt-get autoremove -y --purge
+    sudo apt-get autoclean
+    sudo rm -rf /var/lib/docker /etc/docker
+    sudo rm -f /etc/apt/sources.list.d/docker.list
+    ```
+2. **Add the Docker repository:**
+    ```bash
+    sudo apt-get update
+    sudo apt-get install -y ca-certificates curl gnupg lsb-release
+    sudo mkdir -p /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    sudo chmod a+r /etc/apt/keyrings/docker.gpg
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+    sudo apt-get update
+    ```
+3. **Download the required .deb packages:**
+    ```bash
+    cd ~  # Or any temp dir
+    wget https://download.docker.com/linux/ubuntu/dists/jammy/pool/stable/arm64/containerd.io_1.7.24-1_arm64.deb
+    wget https://download.docker.com/linux/ubuntu/dists/jammy/pool/stable/arm64/docker-ce-cli_27.5.1-1~ubuntu.22.04~jammy_arm64.deb
+    wget https://download.docker.com/linux/ubuntu/dists/jammy/pool/stable/arm64/docker-ce_27.5.1-1~ubuntu.22.04~jammy_arm64.deb
+    # Optional: Rootless extras
+    wget https://download.docker.com/linux/ubuntu/dists/jammy/pool/stable/arm64/docker-ce-rootless-extras_27.5.1-1~ubuntu.22.04~jammy_arm64.deb
+    ```
+4. **Install the packages:**
+    ```bash
+    sudo dpkg -i containerd.io_1.7.24-1_arm64.deb
+    sudo dpkg -i docker-ce-cli_27.5.1-1~ubuntu.22.04~jammy_arm64.deb
+    sudo dpkg -i docker-ce_27.5.1-1~ubuntu.22.04~jammy_arm64.deb
+    # Optional: sudo dpkg -i docker-ce-rootless-extras_27.5.1-1~ubuntu.22.04~jammy_arm64.deb
+    sudo apt-get install -f
+    sudo apt-get install -y docker-buildx-plugin docker-compose-plugin
+    ```
+5. **Start and verify Docker:**
+    ```bash
+    sudo systemctl start docker
+    sudo systemctl enable docker
+    docker --version  # Should show Docker version 27.5.1
+    sudo docker run hello-world
+    ```
+    If you see cgroup warnings (common on Jetson), edit `/boot/extlinux/extlinux.conf` (add `systemd.unified_cgroup_hierarchy=0` to the APPEND line), then reboot.
+
+6. **Prevent auto-upgrades (recommended):**
+    ```bash
+    sudo apt-mark hold docker-ce docker-ce-cli containerd.io
+    ```
+
+---
+
 ## Table of Contents
 
 1. [Quick Start](#quick-start)
-2. [Overview](#overview)
-3. [API Key Setup](#api-key-setup)
-4. [Running the App](#running-the-app)
-5. [Using the Web App](#using-the-web-app)
-6. [Ultrasonic Sensor Integration](#ultrasonic-sensor-integration)
-7. [Cluster Management & GPX Export](#cluster-management--gpx-export)
-8. [Requirements](#requirements)
-9. [Troubleshooting](#troubleshooting)
+2. [Docker Installation (Required Version)](#docker-installation-required-version)
+3. [Overview](#overview)
+4. [API Key Setup](#api-key-setup)
+5. [Running the App](#running-the-app)
+6. [Using the Web App](#using-the-web-app)
+7. [Ultrasonic Sensor Integration](#ultrasonic-sensor-integration)
+8. [Cluster Management & GPX Export](#cluster-management--gpx-export)
+9. [Requirements](#requirements)
+10. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -117,6 +186,8 @@ See `requirements.txt` for all dependencies. Main packages:
 - flask-socketio
 - eventlet
 - gpxpy
+- pyserial
+- pynmea2
 
 ## Troubleshooting
 
@@ -125,6 +196,7 @@ See `requirements.txt` for all dependencies. Main packages:
 - If the app doesn't start, ensure Python 3 is installed and you're in the correct directory.
 - For ultrasonic sensor issues, ensure your hardware is connected and Jetson.GPIO is installed.
 - If the dashboard freezes, ensure only one ultrasonic thread is running and the app is started with `eventlet` monkey patching.
+- For Docker issues, ensure you are using Docker version 27.5.1 and containerd 1.7.24 as described above.
 
 ## Jetson GPIO Pin Setup
 
@@ -134,7 +206,7 @@ If you are running on Jetson hardware, you must configure the TRIG pin as an out
 sudo busybox devmem 0x2448030 w 0xA
 ```
 
-This sets the TRIG GPIO pin to output mode ( required for HC-SR04 operation).
+This sets the TRIG GPIO pin to output mode (required for HC-SR04 operation).
 
 ---
 

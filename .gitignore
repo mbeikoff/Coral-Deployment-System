@@ -1,5 +1,5 @@
 # Ignore API key file
 api_key.py
 flask_session
-__pycache__/ultrasonic.cpython-310.pyc
+__pycache__
 

@@ -1,0 +1,58 @@
+# Build command (run from project root, with Dockerfile in docker/Dockerfile)
+docker build -t coraldeploy-local -f docker/Dockerfile .
+
+# Run command (adjust volume mount as needed for outputs/uploads)
+  sudo docker run -it --rm \
+  --runtime=nvidia --gpus all \
+  --network=host --privileged \
+  --device=/dev/gpiochip0 --device=/dev/gpiochip1 --device=/dev/gpiochip2 \
+  -v /proc/device-tree/compatible:/proc/device-tree/compatible \
+  -v /proc/device-tree/chosen:/proc/device-tree/chosen \
+  -v /sys/devices/:/sys/devices/ \
+  -v /sys/firmware/devicetree:/sys/firmware/devicetree \
+  -v $PWD/output:/app/output \
+  -e JETSON_MODEL_NAME=JETSON_ORIN_NANO \
+  coraldeploy-local
+
+Step 1: Clean Up Existing Docker (If Not Done Already)
+textsudo systemctl stop docker docker.socket containerd
+sudo apt-get purge -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo apt-get autoremove -y --purge
+sudo apt-get autoclean
+sudo rm -rf /var/lib/docker /etc/docker
+sudo rm -f /etc/apt/sources.list.d/docker.list
+Step 2: Re-Add the Docker Repository (For Plugins/Deps)
+Even for manual install, we need the repo for dependencies and plugins:
+textsudo apt-get update
+sudo apt-get install -y ca-certificates curl gnupg lsb-release
+sudo mkdir -p /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+sudo chmod a+r /etc/apt/keyrings/docker.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+sudo apt-get update
+Step 3: Download the Specific .deb Packages for 27.5.1
+Run these in your terminal to fetch the core packages (docker-ce, docker-ce-cli, and a compatible containerd.io). We're using containerd 1.7.24 (a stable match for 27.5.1 from Docker's pool):
+textcd ~  # Or any temp dir
+wget https://download.docker.com/linux/ubuntu/dists/jammy/pool/stable/arm64/containerd.io_1.7.24-1_arm64.deb
+wget https://download.docker.com/linux/ubuntu/dists/jammy/pool/stable/arm64/docker-ce-cli_27.5.1-1~ubuntu.22.04~jammy_arm64.deb
+wget https://download.docker.com/linux/ubuntu/dists/jammy/pool/stable/arm64/docker-ce_27.5.1-1~ubuntu.22.04~jammy_arm64.deb
+# Optional: Rootless extras (for non-root Docker, if needed)
+wget https://download.docker.com/linux/ubuntu/dists/jammy/pool/stable/arm64/docker-ce-rootless-extras_27.5.1-1~ubuntu.22.04~jammy_arm64.deb
+Step 4: Install the Packages
+Install in this order (containerd first, then CLI, then CE; use -f to fix deps):
+textsudo dpkg -i containerd.io_1.7.24-1_arm64.deb
+sudo dpkg -i docker-ce-cli_27.5.1-1~ubuntu.22.04~jammy_arm64.deb
+sudo dpkg -i docker-ce_27.5.1-1~ubuntu.22.04~jammy_arm64.deb
+# Optional: sudo dpkg -i docker-ce-rootless-extras_27.5.1-1~ubuntu.22.04~jammy_arm64.deb
+sudo apt-get install -f  # Resolves any missing deps
+Now install the plugins (latest compatible versions via apt):
+textsudo apt-get install -y docker-buildx-plugin docker-compose-plugin
+Step 5: Start and Verify Docker
+textsudo systemctl start docker
+sudo systemctl enable docker
+docker --version  # Should show Docker version 27.5.1
+sudo docker run hello-world  # Test pull/run
+If you see cgroup warnings (common on Jetson), edit /boot/extlinux/extlinux.conf (add systemd.unified_cgroup_hierarchy=0 to the APPEND line), then reboot.
+Step 6: Prevent Auto-Upgrades (Optional but Recommended)
+To avoid apt upgrading back to 28.x:
+textsudo apt-mark hold docker-ce docker-ce-cli containerd.io

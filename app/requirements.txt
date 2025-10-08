@@ -7,3 +7,8 @@ shapely
 scipy
 geopandas
 flask-session
+flask-socketio
+eventlet
+gpxpy
+pyserial
+pynmea2
