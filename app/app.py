@@ -252,8 +252,8 @@ def dashboard():
     
     def get_colour(decision):
         if decision == 0: return 'red'
-        if decision == 1: return 'yellow'
-        if decision == 2: return 'green'
+        if decision == 1: return 'green'
+        if decision == 2: return 'yellow'
         return 'blue'
     
     for _, row in df.iterrows():
@@ -271,7 +271,7 @@ def dashboard():
     valid_clusters = data['valid_clusters']
     
     # Predefined colors for clusters
-    colors = ['red', 'blue', 'green', 'orange', 'purple', 'brown', 'pink', 'gray', 'olive', 'cyan']
+    colors = ['green', 'blue', 'salmon', 'orange', 'purple', 'brown', 'pink', 'gray', 'olive', 'cyan']
     
     # Prepare cluster_info for template
     cluster_info = []
