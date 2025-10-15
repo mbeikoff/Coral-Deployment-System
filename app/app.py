@@ -251,9 +251,9 @@ def dashboard():
     points_layer = folium.FeatureGroup(name='Points', show=True)
     
     def get_colour(decision):
-        if decision == 0: return 'red'
-        if decision == 1: return 'yellow'
-        if decision == 2: return 'green'
+        if decision == 0: return 'red'      # Don't deploy
+        if decision == 1: return 'green'    # Deploy (now green)
+        if decision == 2: return 'yellow'   # Coral (now yellow)
         return 'blue'
     
     for _, row in df.iterrows():

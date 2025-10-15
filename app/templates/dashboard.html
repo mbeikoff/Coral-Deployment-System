@@ -51,6 +51,18 @@
 </head>
 <body>
     <div class="container-fluid">
+        <!-- Map Legend (Top Right) -->
+        <div id="map-legend" style="position: absolute; top: 18px; right: 28px; z-index: 2000;">
+            <div class="card p-2" style="max-width:350px;">
+                <strong>Legend:</strong>
+                <div style="display:flex;align-items:center;gap:10px;">
+                    <span style="display:inline-block;width:18px;height:18px;background:yellow;border-radius:50%;border:1px solid #ccc;margin-right:6px;"></span> Deploy
+                    <span style="display:inline-block;width:18px;height:18px;background:green;border-radius:50%;border:1px solid #ccc;margin:0 6px;"></span> Coral
+                    <span style="display:inline-block;width:18px;height:18px;background:red;border-radius:50%;border:1px solid #ccc;margin-left:6px;"></span> Don't Deploy
+                </div>
+            </div>
+        </div>
+        <!-- End Map Legend -->
         <div class="row">
             <div class="col-md-3">
                 <div id="status-box" class="p-4 rounded shadow status-no-deploy">
