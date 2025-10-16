@@ -296,8 +296,16 @@
                 alert('Please select at least one cluster to download.');
                 return;
             }
+            // Prompt for file name
+            let filename = prompt('Enter GPX file name (without extension):', '');
+            if (!filename || filename.trim() === '') {
+                // Default to date-time
+                const now = new Date();
+                const pad = n => n.toString().padStart(2, '0');
+                filename = `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())}_${pad(now.getHours())}-${pad(now.getMinutes())}-${pad(now.getSeconds())}`;
+            }
             // Trigger download via query param
-            window.location.href = `/download_gpx?selected=${selected}`;
+            window.location.href = `/download_gpx?selected=${selected}&filename=${encodeURIComponent(filename)}`;
         });
     });
     </script>
