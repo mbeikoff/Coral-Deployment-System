@@ -224,7 +224,7 @@ def dashboard():
     if not data:
         return redirect('/new')
     
-    # Generate map (optimized for speed)
+    # Generate map as Leaflet HTML/JS string (no Folium)
     df = data['df']
     if data.get('hide_no_deploy', True):
         df = df[df['patch_decision'] != 0].copy()  # Filter out no-deploy points
@@ -234,22 +234,9 @@ def dashboard():
     eps = data.get('eps', 50.0)
     min_samples = data.get('min_samples', 2)
     min_cluster_size = data.get('min_cluster_size', 2)
-    tiles = f'https://api.maptiler.com/maps/satellite/{{z}}/{{x}}/{{y}}.png?key={API_KEY}'
-    m = folium.Map(
-        location=[centre_lat, centre_lon], 
-        zoom_start=15,  # Lower zoom for faster initial load
-        tiles=tiles, 
-        attr='© MapTiler', 
-        max_zoom=22,
-        prefer_canvas=True  # Render to canvas for speed with many markers
-    )
     
-    # Add custom style to override Folium's #map with .folium-map for proper sizing
-    m.get_root().header.add_child(Element('<style>.folium-map { height: 80vh; width: 100%; }</style>'))
-    
-    # REVERTED: Show all points individually (no MarkerCluster for full visibility)
-    points_layer = folium.FeatureGroup(name='Points', show=True)
-    
+    # Prepare points data for JS
+    points_data = []
     def get_colour(decision):
         if decision == 0: return 'red'      # Don't deploy
         if decision == 1: return 'green'    # Deploy (now green)
@@ -257,14 +244,13 @@ def dashboard():
         return 'blue'
     
     for _, row in df.iterrows():
-        marker = folium.CircleMarker(
-            [row['patch_lat'], row['patch_lon']], radius=3,
-            popup=f"Patch {row['patch_id']}<br>Decision: {row['patch_decision']}<br>Depth: {row['ping_depth']}",
-            color=get_colour(row['patch_decision']), fill=True, fillOpacity=0.7
-        )
-        marker.add_to(points_layer)  # CHANGED: Add directly to layer (no mc clustering)
-    
-    m.add_child(points_layer)
+        popup_escaped = str(row['patch_id']).replace("'", "\\'") + r"<br>Decision: " + str(row['patch_decision']).replace("'", "\\'") + r"<br>Depth: " + str(row['ping_depth']).replace("'", "\\'")
+        points_data.append({
+            'lat': row['patch_lat'],
+            'lon': row['patch_lon'],
+            'popup': popup_escaped,
+            'color': get_colour(row['patch_decision'])
+        })
     
     # OPTIMIZED: Use stored labeled data (no DBSCAN refit)
     labeled_deploy_df = data['labeled_deploy_df']
@@ -275,6 +261,7 @@ def dashboard():
     
     # Prepare cluster_info for template
     cluster_info = []
+    cluster_layers_js = []  # JS to add cluster layers
     for i, cid in enumerate(valid_clusters):
         color = colors[i % len(colors)]
         cluster_pts = labeled_deploy_df[labeled_deploy_df['cluster'] == cid][['patch_lat', 'patch_lon']].values
@@ -289,11 +276,31 @@ def dashboard():
                 hull_pts = [Point(v[1], v[0]) for v in vertices]  # lat, lon
                 hull_poly = unary_union(hull_pts).convex_hull
                 gdf = gpd.GeoDataFrame({'geometry': [hull_poly]}, crs='EPSG:4326')
+                # GeoJSON for polygon
+                geojson = gdf.to_json()
+                geojson_escaped = geojson.replace("'", "\\'")
+                cluster_layers_js.append(f"""
+                var cluster{cid} = L.geoJSON(JSON.parse('{geojson_escaped}'), {{
+                    style: {{fillColor: '{color}', color: '{color}', weight: 3, fillOpacity: 0.4}},
+                    onEachFeature: function(feature, layer) {{
+                        layer.bindPopup("Cluster {cid}<br>Size: {size} points");
+                    }}
+                }}).addTo(map);
+                overlayLayers['Cluster {cid}'] = cluster{cid};
+                """)
                 area_m2 = round(gdf.to_crs('EPSG:3857').area.iloc[0], 2)
             else:
                 # Approx circle area for small clusters
                 r_m = eps / 2
                 area_m2 = round(np.pi * r_m**2, 2)
+                # Circle for small
+                r_deg = eps / 111000 * 57.3  # Approx degrees to meters conversion
+                cluster_layers_js.append(f"""
+                var cluster{cid} = L.circle([{center_lat}, {center_lon}], {{radius: {r_deg}, color: '{color}', weight: 3, fillColor: '{color}', fillOpacity: 0.4}})
+                    .bindPopup("Cluster {cid}<br>Size: {size} points")
+                    .addTo(map);
+                overlayLayers['Cluster {cid}'] = cluster{cid};
+                """)
             
             cluster_info.append({
                 'cid': cid,
@@ -304,66 +311,50 @@ def dashboard():
                 'color': color
             })
     
-    # Add individual cluster layers directly to map (no parent for clean toggling)
-    for i, cid in enumerate(valid_clusters):
-        color = colors[i % len(colors)]
-        cluster_layer = folium.FeatureGroup(name=f'Cluster {cid}', show=True)
-        cluster_pts = labeled_deploy_df[labeled_deploy_df['cluster'] == cid][['patch_lat', 'patch_lon']].values
-        if len(cluster_pts) >= 3:
-            hull_input = cluster_pts[:, [1, 0]]  # lon, lat for ConvexHull
-            hull = ConvexHull(hull_input)
-            vertices = cluster_pts[hull.vertices]
-            hull_pts = [Point(v[1], v[0]) for v in vertices]  # lat, lon for Point
-            hull_poly = unary_union(hull_pts).convex_hull
-            gdf = gpd.GeoDataFrame({'geometry': [hull_poly]}, crs='EPSG:4326')
-            # Fixed style_function: lambda capturing color
-            style_function = lambda x, col=color: {'fillColor': col, 'color': col, 'weight': 3, 'fillOpacity': 0.4}
-            folium.GeoJson(
-                gdf,
-                style_function=style_function,
-                popup=f"Cluster {cid}<br>Size: {len(cluster_pts)} points"
-            ).add_to(cluster_layer)
-        else:
-            centre = cluster_pts.mean(axis=0)
-            folium.Circle([centre[0], centre[1]], radius=eps / 111000 * 57.3,  # Approx degrees to meters conversion
-                          color=color, weight=3, fillColor=color, fillOpacity=0.4).add_to(cluster_layer)
+    # Build Leaflet map HTML/JS
+    map_html = f"""
+    <div id="map" style="height: 80vh; width: 100%;"></div>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        var map = L.map('map').setView([{centre_lat}, {centre_lon}], 15);
+        L.tileLayer('https://api.maptiler.com/maps/satellite/{{z}}/{{x}}/{{y}}.png?key={API_KEY}', {{
+            attribution: '© MapTiler',
+            maxZoom: 22
+        }}).addTo(map);
         
-        cluster_layer.add_to(m)  # Add directly to map
-    
-    folium.LayerControl().add_to(m)
-    
-    # Add leaflet-realtime for GPS marker
-    dummy_source = JsCode("""
-        function(responseHandler, errorHandler) {
-            // Dummy initial response
-            responseHandler({type: 'FeatureCollection', features: []});
-        }
-    """)
-    
-    rt = Realtime(
-        dummy_source,
-        start=False,
-        get_feature_id=JsCode("(f) => { return f.properties.id; }"),
-        point_to_layer=JsCode("""
-            function(feature, latlng) {
-                return L.marker(latlng, {
-                    icon: L.divIcon({
-                        className: 'gps-marker',
-                        html: '<div style="background: blue; width: 12px; height: 12px; border-radius: 50%; border: 2px solid white; box-shadow: 0 0 5px rgba(0,0,255,0.5);"></div>'
-                    })
-                }).bindPopup('Current GPS Position');
-            }
-        """)
-    )
-    rt.add_to(m)
-    
-    # Assign realtime and map to window
-    map_name = m.get_name()
-    rt_name = rt.get_name()
-    m.get_root().script.add_child(Element(f"window.map = {map_name}; console.log('Map assigned to window.map');"))
-    m.get_root().script.add_child(Element(f"window.realtime = {rt_name}; console.log('Realtime assigned to window.realtime');"))
-    
-    map_html = m._repr_html_()
+        // Points layer
+        var pointsLayer = L.layerGroup();
+        {chr(10).join([f"L.circleMarker([{p['lat']}, {p['lon']}], {{radius: 3, color: '{p['color']}', fill: true, fillOpacity: 0.7}}).bindPopup('{p['popup']}').addTo(pointsLayer);" for p in points_data])}
+        pointsLayer.addTo(map);
+        var overlayLayers = {{'Points': pointsLayer}};
+        
+        // Cluster layers
+        {chr(10).join(cluster_layers_js)}
+        
+        // GPS marker (direct Leaflet marker)
+        var gpsMarker = L.marker([{centre_lat}, {centre_lon}], {{
+            icon: L.divIcon({{
+                className: 'gps-marker',
+                html: '<div style="background: blue; width: 12px; height: 12px; border-radius: 50%; border: 2px solid white; box-shadow: 0 0 5px rgba(0,0,255,0.5);"></div>'
+            }})
+        }}).bindPopup('Current GPS Position').addTo(map);
+        
+        // GPS layer for control
+        var gpsLayer = L.layerGroup([gpsMarker]);
+        gpsLayer.addTo(map);
+        overlayLayers['GPS'] = gpsLayer;
+        
+        // Layer control
+        L.control.layers(null, overlayLayers).addTo(map);
+        
+        window.map = map;
+        window.gpsMarker = gpsMarker;
+        console.log('Map assigned to window.map');
+        console.log('GPS Marker assigned to window.gpsMarker');
+    </script>
+    <style>.gps-marker {{ background: transparent; border: none; }}</style>
+    """
     
     # Stats for dashboard
     start_time = data['start_time']
@@ -446,10 +437,19 @@ def download_gpx():
     print(f"DEBUG: GPX export complete with {route_count} routes")  # Final log
     
     xml = gpx.to_xml()
+    
+    # FIXED: Use the provided filename query param, default to timestamp if empty
+    filename = request.args.get('filename', None)
+    if not filename:
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        filename = f"clusters_{timestamp}"
+    filename += '.gpx'
+    
     return Response(
         xml,
         mimetype="application/gpx+xml",
-        headers={"Content-disposition": "attachment; filename=clusters.gpx"}
+        headers={"Content-disposition": f"attachment; filename={filename}"}
     )
 
 @app.route('/end_session')

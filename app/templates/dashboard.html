@@ -10,7 +10,6 @@
         .status-no-deploy { background: red; color: white; }
         .status-no-session { background: gray; color: white; }
         .readout { font-size: 1em; margin: 5px 0; }
-        .folium-map { height: 80vh; width: 100%; } /* Target .folium-map for sizing */
         h3 { font-size: 1.5em; margin-bottom: 10px; }
         #map-container { padding-bottom: 100px; }
         .fixed-bottom-row {
@@ -126,19 +125,14 @@
     // Store latest GPS for optional replay on map ready
     window.latestGps = null;
 
-    // Helper to update map (extracted for reuse)
+    // Helper to update map (extracted for reuse) - now using direct marker
     function updateMapWithGps(data) {
-        if (window.map && window.realtime) {
-            // Update realtime marker with GeoJSON (note: GeoJSON coords are [lon, lat])
-            var geojson = {
-                type: 'FeatureCollection',
-                features: [{
-                    type: 'Feature',
-                    geometry: {type: 'Point', coordinates: [data.lon, data.lat]},
-                    properties: {id: 'gps'}
-                }]
-            };
-            window.realtime.update(geojson);
+        if (window.map && window.gpsMarker) {
+            console.log('Updating map with GPS:', data.lat, data.lon);  // Debug log
+            // Update GPS marker directly
+            window.gpsMarker.setLatLng([data.lat, data.lon]);
+            window.gpsMarker.getPopup().setContent(`GPS Position<br>Lat: ${data.lat}<br>Lon: ${data.lon}<br>Quality: ${data.qual}`);
+            window.gpsMarker.openPopup();
 
             // Lazy init trail and add point (Leaflet LatLng is [lat, lon])
             if (!window.gpsTrail) {
@@ -150,7 +144,7 @@
             // Auto-pan to new position
             window.map.panTo([data.lat, data.lon], {animate: true, duration: 0.5});
         } else {
-            console.log('Map or realtime not ready yet for GPS update');
+            console.log('Map or gpsMarker not ready yet for GPS update');
         }
     }
 
@@ -249,11 +243,20 @@
         // Initial check
         updateDownloadButton();
 
-        // Wait for map to load before attaching toggles
+        // Wait for map to load before attaching toggles AND replaying any stored GPS
         const mapCheckInterval = setInterval(function() {
             if (window.map) {
                 clearInterval(mapCheckInterval);
-                console.log('Map loaded, attaching toggles');
+                console.log('Map loaded, attaching toggles and checking for GPS replay');
+                
+                // Replay latest GPS if stored (fixes timing issue)
+                if (window.latestGps) {
+                    console.log('Replaying stored GPS data');
+                    updateMapWithGps(window.latestGps);
+                    // Optional: Clear after replay to avoid duplicates on next update
+                    window.latestGps = null;
+                }
+                
                 attachToggleListeners();
             }
         }, 200);
@@ -263,24 +266,26 @@
                 check.addEventListener('change', function() {
                     const cid = this.dataset.cid;
                     const checked = this.checked;
-                    // Recursive toggle function
-                    function findAndToggle(layer) {
-                        if (layer.options && layer.options.name === `Cluster ${cid}`) {
-                            if (checked) {
-                                window.map.addLayer(layer);
-                            } else {
-                                window.map.removeLayer(layer);
+                    // Find and toggle layer by name
+                    if (window.map && window.map.eachLayer) {
+                        function findAndToggle(layer) {
+                            if (layer.options && layer.options.name === `Cluster ${cid}`) {
+                                if (checked) {
+                                    window.map.addLayer(layer);
+                                } else {
+                                    window.map.removeLayer(layer);
+                                }
+                                return true;
                             }
-                            return true;
-                        }
-                        if (layer.getLayers && layer.getLayers().length > 0) {
-                            for (let child of layer.getLayers()) {
-                                if (findAndToggle(child)) return true;
+                            if (layer.getLayers && layer.getLayers().length > 0) {
+                                for (let child of layer.getLayers()) {
+                                    if (findAndToggle(child)) return true;
+                                }
                             }
+                            return false;
                         }
-                        return false;
+                        window.map.eachLayer(findAndToggle);
                     }
-                    window.map.eachLayer(findAndToggle);
                     updateDownloadButton();
                 });
             });
