@@ -1,7 +1,7 @@
 import eventlet
 eventlet.monkey_patch()
 
-from flask import Flask, render_template, request, jsonify, session, redirect, Response, abort
+from flask import Flask, render_template, request, jsonify, session, redirect, Response, abort, flash
 import pandas as pd
 import folium
 from sklearn.cluster import DBSCAN
@@ -22,6 +22,7 @@ from flask_session import Session  # pip install flask-session
 from folium import Element
 from folium.plugins import MarkerCluster, LocateControl, Realtime
 from folium import JsCode
+import io
 
 # pip install gpxpy  # Add this for GPX export
 import gpxpy
@@ -98,8 +99,11 @@ app = Flask(__name__)
 app.secret_key = 'reefscan_secret'  # Change for prod
 app.config['SESSION_TYPE'] = 'filesystem'
 
-# Create storage folder
-STORAGE_FOLDER = os.path.abspath('storage')
+# Get the directory where the script lives
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Create storage folder in the script directory
+STORAGE_FOLDER = os.path.join(SCRIPT_DIR, 'storage')
 os.makedirs(STORAGE_FOLDER, exist_ok=True)
 
 # Database in storage with absolute path
@@ -182,10 +186,12 @@ class ReefSession(db.Model):
     deploy_count = db.Column(db.Integer, default=0)
     total_patches = db.Column(db.Integer)
     csv_filename = db.Column(db.String(200))
+    df_json = db.Column(db.Text)  # New: Store full DF as JSON for resilience
     eps = db.Column(db.Float)
     min_samples = db.Column(db.Integer)
     min_cluster_size = db.Column(db.Integer)
     hide_no_deploy = db.Column(db.Boolean, default=True)
+    status = db.Column(db.String(20), default='ongoing')
     clusters_json = db.Column(db.Text)
     gps_logs = db.relationship('GPSLog', backref='session', lazy=True, cascade='all, delete-orphan')
     deployments = db.relationship('Deployment', backref='session', lazy=True, cascade='all, delete-orphan')
@@ -230,7 +236,10 @@ def new_session():
         
         try:
             df = pd.read_csv(file)
-            file.save(os.path.join(app.config['UPLOAD_FOLDER'], file.filename))
+            if df.empty:
+                return render_template('new.html', error='Uploaded CSV is empty')
+            file_path = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
+            file.save(file_path)
             
             # Clustering (only on decision 2)
             deploy_df = df[df['patch_decision'] == 2].copy()
@@ -259,10 +268,12 @@ def new_session():
                     deploy_count=0,
                     total_patches=len(df),
                     csv_filename=file.filename,
+                    df_json=df.to_json(orient='records'),  # Store full DF as JSON
                     eps=eps,
                     min_samples=min_samples,
                     min_cluster_size=min_cluster_size,
                     hide_no_deploy=hide_no_deploy,
+                    status='ongoing',
                     clusters_json=json.dumps({
                         'blobs': blobs,
                         'labeled_deploy_df': labeled_deploy_df.to_json(orient='records'),
@@ -320,17 +331,43 @@ def resume_session(sid):
     global CURRENT_SESSION_ID, CURRENT_IN_ZONE
     sess = db.session.get(ReefSession, sid)
     if sess is None:
-        abort(404)
+        flash('Session not found.', 'error')
+        return redirect('/history')
+    if sess.status == 'completed':
+        flash('This session is completed and cannot be resumed.', 'error')
+        return redirect('/history')
     if sess.end_time:
         sess.end_time = None
         db.session.commit()
     session['session_id'] = str(sid)
     # Reconstruct data
+    try:
+        # Prefer DF from JSON (resilient to file issues)
+        if sess.df_json:
+            df = pd.read_json(sess.df_json, orient='records')
+        else:
+            # Fallback to file
+            csv_path = os.path.join(UPLOAD_FOLDER, sess.csv_filename)
+            if not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0:
+                raise ValueError("CSV file missing or empty")
+            df = pd.read_csv(csv_path)
+        if df.empty:
+            raise ValueError("Loaded data is empty")
+    except Exception as e:
+        flash(f"Error resuming session: Unable to load data - {str(e)}. Please re-upload if needed.", 'error')
+        return redirect('/history')
+    
     cluster_dict = json.loads(sess.clusters_json or '{}')
-    df = pd.read_csv(os.path.join(UPLOAD_FOLDER, sess.csv_filename))
-    labeled_deploy_df = pd.read_json(cluster_dict['labeled_deploy_df'], orient='records')
+    try:
+        labeled_deploy_df = pd.read_json(cluster_dict['labeled_deploy_df'], orient='records')
+    except (KeyError, ValueError):
+        # Fallback if no labeled data (old session?)
+        labeled_deploy_df = pd.DataFrame()
+        valid_clusters = []
+    else:
+        valid_clusters = cluster_dict.get('valid_clusters', [])
     data = {
-        'blobs': cluster_dict['blobs'],
+        'blobs': cluster_dict.get('blobs', []),
         'start_time': sess.start_time.timestamp(),
         'deploy_count': sess.deploy_count,
         'total_distance': sess.total_distance,
@@ -341,7 +378,7 @@ def resume_session(sid):
         'min_cluster_size': sess.min_cluster_size,
         'hide_no_deploy': sess.hide_no_deploy,
         'labeled_deploy_df': labeled_deploy_df,
-        'valid_clusters': cluster_dict['valid_clusters']
+        'valid_clusters': valid_clusters
     }
     # Set prev_pos from last log
     last_log = GPSLog.query.filter_by(session_id=sid).order_by(GPSLog.timestamp.desc()).first()
@@ -357,6 +394,583 @@ def resume_session(sid):
     clusters_data[str(sid)] = data
     CURRENT_SESSION_ID = str(sid)
     return redirect('/dashboard')
+
+@app.route('/view/<int:sid>')
+def view_session(sid):
+    sess = db.session.get(ReefSession, sid)
+    if sess is None:
+        abort(404)
+    
+    # Reconstruct data similar to resume
+    try:
+        if sess.df_json:
+            df = pd.read_json(sess.df_json, orient='records')
+        else:
+            csv_path = os.path.join(UPLOAD_FOLDER, sess.csv_filename)
+            if not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0:
+                raise ValueError("CSV file missing or empty")
+            df = pd.read_csv(csv_path)
+        if df.empty:
+            raise ValueError("Loaded data is empty")
+    except Exception as e:
+        flash(f"Error loading session data: {str(e)}", 'error')
+        return redirect('/history')
+    
+    cluster_dict = json.loads(sess.clusters_json or '{}')
+    try:
+        labeled_deploy_df = pd.read_json(cluster_dict['labeled_deploy_df'], orient='records')
+    except (KeyError, ValueError):
+        labeled_deploy_df = pd.DataFrame()
+        valid_clusters = []
+    else:
+        valid_clusters = cluster_dict.get('valid_clusters', [])
+    
+    data = {
+        'blobs': cluster_dict.get('blobs', []),
+        'deploy_count': sess.deploy_count,
+        'total_distance': sess.total_distance,
+        'df': df,
+        'eps': sess.eps or 50.0,
+        'min_samples': sess.min_samples or 2,
+        'min_cluster_size': sess.min_cluster_size or 2,
+        'hide_no_deploy': sess.hide_no_deploy,
+        'labeled_deploy_df': labeled_deploy_df,
+        'valid_clusters': valid_clusters
+    }
+    
+    # Load historical data
+    gps_logs = GPSLog.query.filter_by(session_id=sid).order_by(GPSLog.timestamp).all()
+    deployments = Deployment.query.filter_by(session_id=sid).all()
+    
+    # Generate map similar to dashboard, but static
+    df_view = data['df'].copy()
+    if data.get('hide_no_deploy', True):
+        df_view = df_view[df_view['patch_decision'] != 0].copy()
+    centre_lat = df_view['patch_lat'].mean() if not df_view.empty else 0
+    centre_lon = df_view['patch_lon'].mean() if not df_view.empty else 0
+    
+    # Prepare points data for JS
+    points_data = []
+    def get_colour(decision):
+        if decision == 0: return 'red'
+        if decision == 1: return 'green'
+        if decision == 2: return 'yellow'
+        return 'blue'
+    
+    for _, row in df_view.iterrows():
+        popup_escaped = str(row.get('patch_id', '')).replace("'", "\\'") + r"<br>Decision: " + str(row.get('patch_decision', '')).replace("'", "\\'") + r"<br>Depth: " + str(row.get('ping_depth', '')).replace("'", "\\'")
+        points_data.append({
+            'lat': row['patch_lat'],
+            'lon': row['patch_lon'],
+            'popup': popup_escaped,
+            'color': get_colour(row['patch_decision'])
+        })
+    
+    # Clusters
+    colors = ['red', 'blue', 'green', 'orange', 'purple', 'brown', 'pink', 'gray', 'olive', 'cyan']
+    cluster_info = []
+    cluster_layers_js = []
+    for i, cid in enumerate(valid_clusters):
+        color = colors[i % len(colors)]
+        cluster_pts = labeled_deploy_df[labeled_deploy_df['cluster'] == cid][['patch_lat', 'patch_lon']].values
+        size = len(cluster_pts)
+        if size > 0:
+            center_lat, center_lon = cluster_pts.mean(axis=0)
+            if size >= 3:
+                hull_input = cluster_pts[:, [1, 0]]  # lon, lat
+                hull = ConvexHull(hull_input)
+                vertices = cluster_pts[hull.vertices]
+                hull_pts = [Point(v[1], v[0]) for v in vertices]  # lat, lon
+                hull_poly = unary_union(hull_pts).convex_hull
+                gdf = gpd.GeoDataFrame({'geometry': [hull_poly]}, crs='EPSG:4326')
+                geojson = gdf.to_json()
+                geojson_escaped = geojson.replace("'", "\\'")
+                cluster_layers_js.append(f"""
+                var cluster{cid} = L.geoJSON(JSON.parse('{geojson_escaped}'), {{
+                    style: {{fillColor: '{color}', color: '{color}', weight: 3, fillOpacity: 0.4}},
+                    onEachFeature: function(feature, layer) {{
+                        layer.bindPopup("Cluster {cid}<br>Size: {size} points");
+                    }}
+                }}).addTo(map);
+                """)
+                area_m2 = round(gdf.to_crs('EPSG:3857').area.iloc[0], 2)
+            else:
+                r_m = data['eps'] / 2
+                area_m2 = round(np.pi * r_m**2, 2)
+                r_deg = data['eps'] / 111000 * 57.3
+                cluster_layers_js.append(f"""
+                var cluster{cid} = L.circle([{center_lat}, {center_lon}], {{radius: {r_deg}, color: '{color}', weight: 3, fillColor: '{color}', fillOpacity: 0.4}})
+                    .bindPopup("Cluster {cid}<br>Size: {size} points")
+                    .addTo(map);
+                """)
+            
+            cluster_info.append({
+                'cid': cid,
+                'size': size,
+                'center_lat': round(float(center_lat), 6),
+                'center_lon': round(float(center_lon), 6),
+                'area_m2': area_m2,
+                'color': color
+            })
+    
+    # Historical trail
+    historical_trail_js = ""
+    if gps_logs:
+        points_js = chr(10).join([f"[{log.lat}, {log.lon}]," for log in gps_logs])
+        historical_trail_js = f"""
+        var historicalTrail = L.polyline([
+        {points_js}
+        ], {{color: 'gray', weight: 2, dashArray: '5,5', opacity: 0.6}}).addTo(map);
+        """
+    
+    # Past deployments
+    past_deploys_js = ""
+    if deployments:
+        dep_markers_js = chr(10).join([f"""
+        var depMarker{dep.id} = L.marker([{dep.lat}, {dep.lon}], {{
+            icon: L.divIcon({{
+                className: 'deploy-marker',
+                html: '<div style="background: orange; width: 16px; height: 16px; border-radius: 50%; border: 2px solid white;"></div>'
+            }})
+        }}).bindPopup('Past Deployment<br>Time: {dep.timestamp.strftime("%H:%M:%S")}<br>Dist: {dep.ultrasonic_distance} cm{"<br>Cluster: " + str(dep.cluster_id) if dep.cluster_id else ""}');
+        pastDeploysLayer.addLayer(depMarker{dep.id});
+        """ for dep in deployments])
+        past_deploys_js = f"""
+        var pastDeploysLayer = L.layerGroup();
+        {dep_markers_js}
+        pastDeploysLayer.addTo(map);
+        """
+    
+    # Build static map
+    map_html = f"""
+    <div id="map" style="height: 60vh; width: 100%;"></div>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        var map = L.map('map').setView([{centre_lat}, {centre_lon}], 15);
+        L.tileLayer('https://api.maptiler.com/maps/satellite/{{z}}/{{x}}/{{y}}.png?key={API_KEY}', {{
+            attribution: '© MapTiler',
+            maxZoom: 22
+        }}).addTo(map);
+        
+        // Points layer
+        var pointsLayer = L.layerGroup();
+        {chr(10).join([f"L.circleMarker([{p['lat']}, {p['lon']}], {{radius: 3, color: '{p['color']}', fill: true, fillOpacity: 0.7}}).bindPopup('{p['popup']}').addTo(pointsLayer);" for p in points_data])}
+        pointsLayer.addTo(map);
+        
+        // Cluster layers
+        {chr(10).join(cluster_layers_js)}
+        
+        // Historical trail
+        {historical_trail_js}
+        
+        // Past deployments
+        {past_deploys_js}
+        
+        window.map = map;
+    </script>
+    <style>.deploy-marker {{ background: transparent; border: none; }}</style>
+    """
+    
+    # Prepare data for tables
+    patches_data = df.to_dict('records')
+    gps_data = [{'timestamp': log.timestamp.strftime('%Y-%m-%d %H:%M:%S'), 'lat': log.lat, 'lon': log.lon, 'speed': log.speed, 'depth': log.depth, 'qual': log.qual, 'sats': log.sats, 'hdop': log.hdop} for log in gps_logs]
+    deploys_data = [{'timestamp': dep.timestamp.strftime('%Y-%m-%d %H:%M:%S'), 'lat': dep.lat, 'lon': dep.lon, 'ultrasonic_distance': dep.ultrasonic_distance, 'cluster_id': dep.cluster_id} for dep in deployments]
+    
+    # Stats
+    mission_time = str(timedelta(seconds=int((sess.end_time - sess.start_time).total_seconds()))) if sess.end_time else 'N/A'
+    stats = {
+        'mission_time': mission_time,
+        'deploy_count': sess.deploy_count,
+        'total_distance': f"{sess.total_distance:.2f} km",
+        'total_patches': sess.total_patches,
+        'blobs': len(cluster_info)
+    }
+    
+    return render_template('view.html', map_html=map_html, stats=stats, cluster_info=cluster_info, 
+                           patches_data=patches_data, gps_data=gps_data, deploys_data=deploys_data, sid=sid)
+
+@app.route('/export/<int:sid>')
+def export_session(sid):
+    sess = db.session.get(ReefSession, sid)
+    if sess is None:
+        abort(404)
+    
+    try:
+        if sess.df_json:
+            df = pd.read_json(sess.df_json, orient='records')
+        else:
+            csv_path = os.path.join(UPLOAD_FOLDER, sess.csv_filename)
+            df = pd.read_csv(csv_path)
+        
+        gps_logs = GPSLog.query.filter_by(session_id=sid).all()
+        gps_df = pd.DataFrame([
+            {'timestamp': log.timestamp, 'lat': log.lat, 'lon': log.lon, 'speed': log.speed, 'depth': log.depth, 'qual': log.qual, 'sats': log.sats, 'hdop': log.hdop}
+            for log in gps_logs
+        ])
+        
+        deployments = Deployment.query.filter_by(session_id=sid).all()
+        deploys_df = pd.DataFrame([
+            {'timestamp': dep.timestamp, 'lat': dep.lat, 'lon': dep.lon, 'ultrasonic_distance': dep.ultrasonic_distance, 'cluster_id': dep.cluster_id}
+            for dep in deployments
+        ])
+        
+        # Combine into one DF with session info
+        df['session_id'] = sid
+        df['session_start'] = sess.start_time
+        df['session_end'] = sess.end_time
+        gps_df['session_id'] = sid
+        gps_df['session_start'] = sess.start_time
+        gps_df['session_end'] = sess.end_time
+        deploys_df['session_id'] = sid
+        deploys_df['session_start'] = sess.start_time
+        deploys_df['session_end'] = sess.end_time
+        
+        combined_df = pd.concat([df, gps_df, deploys_df], ignore_index=True, sort=False)
+        combined_df = combined_df.fillna('')
+        
+        output = io.StringIO()
+        combined_df.to_csv(output, index=False)
+        csv_content = output.getvalue()
+        
+        filename = f"session_{sid}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
+        
+        return Response(
+            csv_content,
+            mimetype="text/csv",
+            headers={"Content-disposition": f"attachment; filename={filename}"}
+        )
+    except Exception as e:
+        abort(500, description=str(e))
+
+# API endpoint for live ultrasonic sensor data
+@app.route('/api/ultrasonic')
+def ultrasonic_api():
+    try:
+        distance = get_ultrasonic_distance()
+        return jsonify({'distance': distance})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/download_gpx')
+def download_gpx():
+    session_id = request.args.get('session_id') or session.get('session_id')
+    if not session_id:
+        return redirect('/new')
+    
+    selected_str = request.args.get('selected', None)
+    try:
+        sid = int(session_id)
+        sess = db.session.get(ReefSession, sid)
+        if sess is None:
+            return redirect('/new')
+        
+        cluster_dict = json.loads(sess.clusters_json or '{}')
+        labeled_deploy_df = pd.read_json(cluster_dict['labeled_deploy_df'], orient='records')
+        valid_clusters = cluster_dict['valid_clusters']
+        
+        # Filter by selected if provided
+        if selected_str:
+            try:
+                selected = [int(c.strip()) for c in selected_str.split(',') if c.strip()]
+                valid_clusters = [c for c in valid_clusters if c in selected]
+            except ValueError:
+                pass  # Invalid, fall back to all
+        
+        print(f"DEBUG: Starting GPX export for {len(valid_clusters)} clusters (selected: {selected_str})")  # Console log
+        
+        gpx = gpxpy.gpx.GPX()
+        route_count = 0
+        
+        for cid in valid_clusters:
+            try:
+                cluster_pts = labeled_deploy_df[labeled_deploy_df['cluster'] == cid][['patch_lat', 'patch_lon']].values  # [lat, lon]
+                route_name = f"Cluster {cid} (size: {len(cluster_pts)})"
+                route = gpxpy.gpx.GPXRoute(name=route_name, description=f"Convex hull boundary for cluster {cid}")
+                
+                if len(cluster_pts) >= 3:
+                    hull_input = cluster_pts[:, [1, 0]]  # [lon, lat] for ConvexHull
+                    hull = ConvexHull(hull_input)
+                    ordered_cluster_pts = cluster_pts[hull.vertices]  # ordered [lat, lon]
+                    for lat, lon in ordered_cluster_pts:
+                        rtept = gpxpy.gpx.GPXRoutePoint(latitude=lat, longitude=lon)
+                        route.points.append(rtept)
+                    # Close the route for a polygon-like boundary
+                    if len(route.points) > 0:
+                        route.points.append(route.points[0])
+                else:
+                    # For small clusters, add all points (no hull)
+                    for lat, lon in cluster_pts:
+                        rtept = gpxpy.gpx.GPXRoutePoint(latitude=lat, longitude=lon)
+                        route.points.append(rtept)
+                
+                gpx.routes.append(route)
+                route_count += 1
+                print(f"DEBUG: Added route for cluster {cid} ({len(route.points)} points)")
+            except Exception as e:
+                print(f"DEBUG: Skipped cluster {cid} due to error: {e}")
+                continue  # Skip bad cluster but continue with others
+        
+        print(f"DEBUG: GPX export complete with {route_count} routes")  # Final log
+        
+        xml = gpx.to_xml()
+        
+        # FIXED: Use the provided filename query param, default to timestamp if empty
+        filename = request.args.get('filename', None)
+        if not filename:
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            filename = f"clusters_{timestamp}"
+        filename += '.gpx'
+        
+        return Response(
+            xml,
+            mimetype="application/gpx+xml",
+            headers={"Content-disposition": f"attachment; filename={filename}"}
+        )
+    except ValueError:
+        return redirect('/new')
+
+@app.route('/api/delete_session/<int:sid>', methods=['DELETE', 'POST'])
+def delete_session(sid):
+    sess = db.session.get(ReefSession, sid)
+    if not sess:
+        return jsonify({'error': 'Session not found'}), 404
+    session_id = str(sid)
+    if session_id in clusters_data:
+        del clusters_data[session_id]
+    if session.get('session_id') == session_id:
+        session.pop('session_id')
+    global CURRENT_SESSION_ID, CURRENT_IN_ZONE
+    if CURRENT_SESSION_ID == session_id:
+        CURRENT_SESSION_ID = None
+        CURRENT_IN_ZONE = False
+    db.session.delete(sess)
+    db.session.commit()
+    return jsonify({'status': 'deleted'})
+
+@app.route('/end_session')
+def end_session():
+    global CURRENT_SESSION_ID, CURRENT_IN_ZONE
+    mode = request.args.get('mode', 'save')
+    if 'session_id' not in session:
+        return redirect('/')
+    session_id = session['session_id']
+    data = clusters_data.pop(session_id, None)
+    sid = int(session_id)
+    sess = db.session.get(ReefSession, sid)
+    if not sess:
+        return redirect('/')
+    if mode == 'pause':
+        sess.end_time = None
+        sess.status = 'paused'
+        db.session.commit()
+        session.pop('session_id')
+        CURRENT_SESSION_ID = None
+        CURRENT_IN_ZONE = False
+        return redirect('/history')
+    else:
+        # save/completed
+        sess.end_time = datetime.now()
+        sess.status = 'completed'
+        if data:
+            sess.total_distance = data.get('total_distance', sess.total_distance)
+            sess.deploy_count = data.get('deploy_count', sess.deploy_count)
+            sess.clusters_json = json.dumps({
+                'blobs': data['blobs'],
+                'labeled_deploy_df': data['labeled_deploy_df'].to_json(orient='records'),
+                'valid_clusters': data['valid_clusters']
+            })
+        db.session.commit()
+        session.pop('session_id')
+        CURRENT_SESSION_ID = None
+        CURRENT_IN_ZONE = False
+        
+        # Reconstruct data for summary view
+        try:
+            if sess.df_json:
+                df = pd.read_json(sess.df_json, orient='records')
+            else:
+                csv_path = os.path.join(UPLOAD_FOLDER, sess.csv_filename)
+                df = pd.read_csv(csv_path)
+            if df.empty:
+                raise ValueError("Loaded data is empty")
+        except Exception as e:
+            flash(f"Error loading session data for summary: {str(e)}", 'error')
+            return redirect('/history')
+        
+        cluster_dict = json.loads(sess.clusters_json or '{}')
+        try:
+            labeled_deploy_df = pd.read_json(cluster_dict['labeled_deploy_df'], orient='records')
+        except (KeyError, ValueError):
+            labeled_deploy_df = pd.DataFrame()
+            valid_clusters = []
+        else:
+            valid_clusters = cluster_dict.get('valid_clusters', [])
+        
+        view_data = {
+            'blobs': cluster_dict.get('blobs', []),
+            'deploy_count': sess.deploy_count,
+            'total_distance': sess.total_distance,
+            'df': df,
+            'eps': sess.eps or 50.0,
+            'min_samples': sess.min_samples or 2,
+            'min_cluster_size': sess.min_cluster_size or 2,
+            'hide_no_deploy': sess.hide_no_deploy,
+            'labeled_deploy_df': labeled_deploy_df,
+            'valid_clusters': valid_clusters
+        }
+        
+        # Load historical data
+        gps_logs = GPSLog.query.filter_by(session_id=sid).order_by(GPSLog.timestamp).all()
+        deployments = Deployment.query.filter_by(session_id=sid).all()
+        
+        # Generate map similar to dashboard, but static
+        df_view = view_data['df'].copy()
+        if view_data.get('hide_no_deploy', True):
+            df_view = df_view[df_view['patch_decision'] != 0].copy()
+        centre_lat = df_view['patch_lat'].mean() if not df_view.empty else 0
+        centre_lon = df_view['patch_lon'].mean() if not df_view.empty else 0
+        
+        # Prepare points data for JS
+        points_data = []
+        def get_colour(decision):
+            if decision == 0: return 'red'
+            if decision == 1: return 'green'
+            if decision == 2: return 'yellow'
+            return 'blue'
+        
+        for _, row in df_view.iterrows():
+            popup_escaped = str(row.get('patch_id', '')).replace("'", "\\'") + r"<br>Decision: " + str(row.get('patch_decision', '')).replace("'", "\\'") + r"<br>Depth: " + str(row.get('ping_depth', '')).replace("'", "\\'")
+            points_data.append({
+                'lat': row['patch_lat'],
+                'lon': row['patch_lon'],
+                'popup': popup_escaped,
+                'color': get_colour(row['patch_decision'])
+            })
+        
+        # Clusters
+        colors = ['red', 'blue', 'green', 'orange', 'purple', 'brown', 'pink', 'gray', 'olive', 'cyan']
+        cluster_info = []
+        cluster_layers_js = []
+        for i, cid in enumerate(valid_clusters):
+            color = colors[i % len(colors)]
+            cluster_pts = labeled_deploy_df[labeled_deploy_df['cluster'] == cid][['patch_lat', 'patch_lon']].values
+            size = len(cluster_pts)
+            if size > 0:
+                center_lat, center_lon = cluster_pts.mean(axis=0)
+                if size >= 3:
+                    hull_input = cluster_pts[:, [1, 0]]  # lon, lat
+                    hull = ConvexHull(hull_input)
+                    vertices = cluster_pts[hull.vertices]
+                    hull_pts = [Point(v[1], v[0]) for v in vertices]  # lat, lon
+                    hull_poly = unary_union(hull_pts).convex_hull
+                    gdf = gpd.GeoDataFrame({'geometry': [hull_poly]}, crs='EPSG:4326')
+                    geojson = gdf.to_json()
+                    geojson_escaped = geojson.replace("'", "\\'")
+                    cluster_layers_js.append(f"""
+                    var cluster{cid} = L.geoJSON(JSON.parse('{geojson_escaped}'), {{
+                        style: {{fillColor: '{color}', color: '{color}', weight: 3, fillOpacity: 0.4}},
+                        onEachFeature: function(feature, layer) {{
+                            layer.bindPopup("Cluster {cid}<br>Size: {size} points");
+                        }}
+                    }}).addTo(map);
+                    """)
+                    area_m2 = round(gdf.to_crs('EPSG:3857').area.iloc[0], 2)
+                else:
+                    r_m = view_data['eps'] / 2
+                    area_m2 = round(np.pi * r_m**2, 2)
+                    r_deg = view_data['eps'] / 111000 * 57.3
+                    cluster_layers_js.append(f"""
+                    var cluster{cid} = L.circle([{center_lat}, {center_lon}], {{radius: {r_deg}, color: '{color}', weight: 3, fillColor: '{color}', fillOpacity: 0.4}})
+                        .bindPopup("Cluster {cid}<br>Size: {size} points")
+                        .addTo(map);
+                    """)
+                
+                cluster_info.append({
+                    'cid': cid,
+                    'size': size,
+                    'center_lat': round(float(center_lat), 6),
+                    'center_lon': round(float(center_lon), 6),
+                    'area_m2': area_m2,
+                    'color': color
+                })
+        
+        # Historical trail
+        historical_trail_js = ""
+        if gps_logs:
+            points_js = chr(10).join([f"[{log.lat}, {log.lon}]," for log in gps_logs])
+            historical_trail_js = f"""
+            var historicalTrail = L.polyline([
+            {points_js}
+            ], {{color: 'gray', weight: 2, dashArray: '5,5', opacity: 0.6}}).addTo(map);
+            """
+        
+        # Past deployments
+        past_deploys_js = ""
+        if deployments:
+            dep_markers_js = chr(10).join([f"""
+            var depMarker{dep.id} = L.marker([{dep.lat}, {dep.lon}], {{
+                icon: L.divIcon({{
+                    className: 'deploy-marker',
+                    html: '<div style="background: orange; width: 16px; height: 16px; border-radius: 50%; border: 2px solid white;"></div>'
+                }})
+            }}).bindPopup('Past Deployment<br>Time: {dep.timestamp.strftime("%H:%M:%S")}<br>Dist: {dep.ultrasonic_distance} cm{"<br>Cluster: " + str(dep.cluster_id) if dep.cluster_id else ""}');
+            pastDeploysLayer.addLayer(depMarker{dep.id});
+            """ for dep in deployments])
+            past_deploys_js = f"""
+            var pastDeploysLayer = L.layerGroup();
+            {dep_markers_js}
+            pastDeploysLayer.addTo(map);
+            """
+        
+        # Build static map
+        map_html = f"""
+        <div id="map" style="height: 60vh; width: 100%;"></div>
+        <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+        <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+        <script>
+            var map = L.map('map').setView([{centre_lat}, {centre_lon}], 15);
+            L.tileLayer('https://api.maptiler.com/maps/satellite/{{z}}/{{x}}/{{y}}.png?key={API_KEY}', {{
+                attribution: '© MapTiler',
+                maxZoom: 22
+            }}).addTo(map);
+            
+            // Points layer
+            var pointsLayer = L.layerGroup();
+            {chr(10).join([f"L.circleMarker([{p['lat']}, {p['lon']}], {{radius: 3, color: '{p['color']}', fill: true, fillOpacity: 0.7}}).bindPopup('{p['popup']}').addTo(pointsLayer);" for p in points_data])}
+            pointsLayer.addTo(map);
+            
+            // Cluster layers
+            {chr(10).join(cluster_layers_js)}
+            
+            // Historical trail
+            {historical_trail_js}
+            
+            // Past deployments
+            {past_deploys_js}
+            
+            window.map = map;
+        </script>
+        <style>.deploy-marker {{ background: transparent; border: none; }}</style>
+        """
+        
+        # Prepare data for tables
+        patches_data = df.to_dict('records')
+        gps_data = [{'timestamp': log.timestamp.strftime('%Y-%m-%d %H:%M:%S'), 'lat': log.lat, 'lon': log.lon, 'speed': log.speed, 'depth': log.depth, 'qual': log.qual, 'sats': log.sats, 'hdop': log.hdop} for log in gps_logs]
+        deploys_data = [{'timestamp': dep.timestamp.strftime('%Y-%m-%d %H:%M:%S'), 'lat': dep.lat, 'lon': dep.lon, 'ultrasonic_distance': dep.ultrasonic_distance, 'cluster_id': dep.cluster_id} for dep in deployments]
+        
+        # Stats
+        mission_time = str(timedelta(seconds=int((datetime.now() - sess.start_time).total_seconds())))
+        final_stats = {
+            'mission_time': mission_time,
+            'deploy_count': sess.deploy_count,
+            'total_distance': f"{sess.total_distance:.2f} km",
+            'total_patches': sess.total_patches,
+            'blobs': len(cluster_info)
+        }
+        
+        return render_template('summary.html', map_html=map_html, stats=final_stats, cluster_info=cluster_info, 
+                               patches_data=patches_data, gps_data=gps_data, deploys_data=deploys_data, sid=sid)
 
 @app.route('/dashboard')
 def dashboard():
@@ -556,143 +1170,20 @@ def dashboard():
         'blobs': len(cluster_info),
         'ultrasonic_distance': ultrasonic_distance
     }
-    return render_template('dashboard.html', map_html=map_html, stats=stats, cluster_info=cluster_info, gps_logs=gps_logs, deployments=deployments)
-
-# API endpoint for live ultrasonic sensor data
-@app.route('/api/ultrasonic')
-def ultrasonic_api():
-    try:
-        distance = get_ultrasonic_distance()
-        return jsonify({'distance': distance})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/download_gpx')
-def download_gpx():
-    session_id = request.args.get('session_id') or session.get('session_id')
-    if not session_id:
-        return redirect('/new')
-    
-    selected_str = request.args.get('selected', None)
-    try:
-        sid = int(session_id)
-        sess = db.session.get(ReefSession, sid)
-        if sess is None:
-            return redirect('/new')
-        
-        cluster_dict = json.loads(sess.clusters_json or '{}')
-        labeled_deploy_df = pd.read_json(cluster_dict['labeled_deploy_df'], orient='records')
-        valid_clusters = cluster_dict['valid_clusters']
-        
-        # Filter by selected if provided
-        if selected_str:
-            try:
-                selected = [int(c.strip()) for c in selected_str.split(',') if c.strip()]
-                valid_clusters = [c for c in valid_clusters if c in selected]
-            except ValueError:
-                pass  # Invalid, fall back to all
-        
-        print(f"DEBUG: Starting GPX export for {len(valid_clusters)} clusters (selected: {selected_str})")  # Console log
-        
-        gpx = gpxpy.gpx.GPX()
-        route_count = 0
-        
-        for cid in valid_clusters:
-            try:
-                cluster_pts = labeled_deploy_df[labeled_deploy_df['cluster'] == cid][['patch_lat', 'patch_lon']].values  # [lat, lon]
-                route_name = f"Cluster {cid} (size: {len(cluster_pts)})"
-                route = gpxpy.gpx.GPXRoute(name=route_name, description=f"Convex hull boundary for cluster {cid}")
-                
-                if len(cluster_pts) >= 3:
-                    hull_input = cluster_pts[:, [1, 0]]  # [lon, lat] for ConvexHull
-                    hull = ConvexHull(hull_input)
-                    ordered_cluster_pts = cluster_pts[hull.vertices]  # ordered [lat, lon]
-                    for lat, lon in ordered_cluster_pts:
-                        rtept = gpxpy.gpx.GPXRoutePoint(latitude=lat, longitude=lon)
-                        route.points.append(rtept)
-                    # Close the route for a polygon-like boundary
-                    if len(route.points) > 0:
-                        route.points.append(route.points[0])
-                else:
-                    # For small clusters, add all points (no hull)
-                    for lat, lon in cluster_pts:
-                        rtept = gpxpy.gpx.GPXRoutePoint(latitude=lat, longitude=lon)
-                        route.points.append(rtept)
-                
-                gpx.routes.append(route)
-                route_count += 1
-                print(f"DEBUG: Added route for cluster {cid} ({len(route.points)} points)")
-            except Exception as e:
-                print(f"DEBUG: Skipped cluster {cid} due to error: {e}")
-                continue  # Skip bad cluster but continue with others
-        
-        print(f"DEBUG: GPX export complete with {route_count} routes")  # Final log
-        
-        xml = gpx.to_xml()
-        
-        # FIXED: Use the provided filename query param, default to timestamp if empty
-        filename = request.args.get('filename', None)
-        if not filename:
-            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            filename = f"clusters_{timestamp}"
-        filename += '.gpx'
-        
-        return Response(
-            xml,
-            mimetype="application/gpx+xml",
-            headers={"Content-disposition": f"attachment; filename={filename}"}
-        )
-    except ValueError:
-        return redirect('/new')
-
-@app.route('/end_session')
-def end_session():
-    global CURRENT_SESSION_ID, CURRENT_IN_ZONE
-    if 'session_id' in session:
-        session_id = session['session_id']
-        data = clusters_data.pop(session_id, None)
-        sid = int(session_id)
-        sess = db.session.get(ReefSession, sid)
-        if sess:
-            sess.end_time = datetime.now()
-            sess.total_distance = data.get('total_distance', sess.total_distance) if data else sess.total_distance
-            sess.deploy_count = data.get('deploy_count', sess.deploy_count) if data else sess.deploy_count
-            if data:
-                sess.clusters_json = json.dumps({
-                    'blobs': data['blobs'],
-                    'labeled_deploy_df': data['labeled_deploy_df'].to_json(orient='records'),
-                    'valid_clusters': data['valid_clusters']
-                })
-            db.session.commit()
-        session.pop('session_id')
-        CURRENT_SESSION_ID = None
-        CURRENT_IN_ZONE = False
-        if sess:
-            mission_time = str(timedelta(seconds=int((datetime.now() - sess.start_time).total_seconds())))
-            cluster_dict = json.loads(sess.clusters_json or '{}')
-            final_stats = {
-                'mission_time': mission_time,
-                'deploy_count': sess.deploy_count,
-                'total_distance': f"{sess.total_distance:.2f} km",
-                'total_patches': sess.total_patches,
-                'blobs': len(cluster_dict.get('valid_clusters', []))
-            }
-            return render_template('summary.html', stats=final_stats)
-    return redirect('/')
+    return render_template('dashboard.html', map_html=map_html, stats=stats, cluster_info=cluster_info, gps_logs=gps_logs, deployments=deployments, sid=sid)
 
 @app.route('/history')
 def history():
     sessions_query = ReefSession.query.order_by(ReefSession.start_time.desc()).all()
     sessions = []
     for s in sessions_query:
-        duration = None
-        status = 'Ongoing'
-        if s.end_time:
+        if s.status == 'completed':
             duration_secs = (s.end_time - s.start_time).total_seconds()
             duration = f"{duration_secs / 3600:.1f}h"
-            status = 'Ended'
+            status = 'Completed'
         else:
-            duration = 'Ongoing'
+            duration = 'Ongoing' if s.status == 'ongoing' else 'Paused'
+            status = 'Ongoing' if s.status == 'ongoing' else 'Paused'
         sessions.append({
             'id': s.id,
             'start_time': s.start_time.strftime('%Y-%m-%d %H:%M'),
@@ -897,6 +1388,23 @@ threading.Thread(target=gps_monitor, daemon=True).start()
 if __name__ == '__main__':
     with app.app_context():
         db.create_all()
+        # Migrate: add df_json if missing
+        from sqlalchemy import inspect
+        inspector = inspect(db.engine)
+        if 'reef_session' in inspector.get_table_names():
+            columns = [c['name'] for c in inspector.get_columns('reef_session')]
+            if 'df_json' not in columns:
+                with db.engine.connect() as conn:
+                    conn.execute(db.text("ALTER TABLE reef_session ADD COLUMN df_json TEXT"))
+                    conn.commit()
+                print("Added df_json column to reef_session table.")
+            if 'status' not in columns:
+                with db.engine.connect() as conn:
+                    conn.execute(db.text("ALTER TABLE reef_session ADD COLUMN status VARCHAR(20) DEFAULT 'ongoing'"))
+                    conn.execute(db.text("UPDATE reef_session SET status = 'completed' WHERE end_time IS NOT NULL"))
+                    conn.execute(db.text("UPDATE reef_session SET status = 'ongoing' WHERE status IS NULL"))
+                    conn.commit()
+                print("Added status column to reef_session table.")
     try:
         # Set log_output=True to show the server address (and other startup info)
         socketio.run(app, debug=True, log_output=True)

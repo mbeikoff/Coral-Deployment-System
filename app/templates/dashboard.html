@@ -108,13 +108,36 @@
                         <p>Total Patches: {{ stats.total if 'total' in stats else 0 }}</p>
                         <p>Valid Blobs: {{ stats.blobs }}</p>
                         <a href="/history" class="btn btn-info me-2">View History</a>
-                        <a href="/end_session" class="btn btn-secondary">End Session</a>
+                        <button id="end-session-btn" class="btn btn-secondary" data-bs-toggle="modal" data-bs-target="#endModal">End Session</button>
                     </div>
                 </div>
             </div>
         </div>
     </div>
+
+    <!-- End Session Modal -->
+    <div class="modal fade" id="endModal" tabindex="-1" aria-labelledby="endModalLabel" aria-hidden="true">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="endModalLabel">End Current Session</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body">
+                    <p>Choose an option for this session:</p>
+                    <div class="d-grid gap-2">
+                        <button id="discard-btn" class="btn btn-danger">Discard (Delete Session)</button>
+                        <button id="pause-btn" class="btn btn-warning">Pause (Resume Later)</button>
+                        <button id="save-btn" class="btn btn-success">End and Save (View Summary)</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <!-- End Modal -->
+
     <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
     <script>
     // Connect to Socket.IO early for immediate event reception
     console.log('Connecting to Socket.IO...');
@@ -233,6 +256,7 @@
         console.log('DOM loaded');
         const checks = document.querySelectorAll('.cluster-check');
         const downloadBtn = document.getElementById('download-selected');
+        const sid = {{ sid }};
 
         function updateDownloadButton() {
             const selected = Array.from(checks).filter(c => c.checked).length;
@@ -306,6 +330,37 @@
             }
             // Trigger download via query param
             window.location.href = `/download_gpx?selected=${selected}&filename=${encodeURIComponent(filename)}`;
+        });
+
+        // End session modal handlers
+        const endModal = new bootstrap.Modal(document.getElementById('endModal'));
+        document.getElementById('end-session-btn').addEventListener('click', function() {
+            endModal.show();
+        });
+
+        document.getElementById('discard-btn').addEventListener('click', function() {
+            if (confirm('Are you sure? This will permanently delete the session and all associated data.')) {
+                fetch(`/api/delete_session/${sid}`, {method: 'DELETE'})
+                    .then(r => r.json())
+                    .then(data => {
+                        endModal.hide();
+                        window.location.href = '/';
+                    })
+                    .catch(err => {
+                        alert('Error deleting session: ' + err);
+                        endModal.hide();
+                    });
+            }
+        });
+
+        document.getElementById('pause-btn').addEventListener('click', function() {
+            endModal.hide();
+            window.location.href = '/end_session?mode=pause';
+        });
+
+        document.getElementById('save-btn').addEventListener('click', function() {
+            endModal.hide();
+            window.location.href = '/end_session';
         });
     });
     </script>
