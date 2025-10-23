@@ -298,11 +298,12 @@ def configure_session(sid):
     if sess is None:
         abort(404)
     
+    hide_no_deploy = request.args.get('hide_no_deploy') == 'on'
+    
     # Override with query params if provided
     eps = float(request.args.get('eps', sess.eps or 50.0))
     min_samples = int(request.args.get('min_samples', sess.min_samples or 2))
     min_cluster_size = int(request.args.get('min_cluster_size', sess.min_cluster_size or 2))
-    hide_no_deploy = request.args.get('hide_no_deploy', 'on') == 'on'
     
     # Update session with new params
     sess.eps = eps
@@ -553,8 +554,11 @@ def resume_session(sid):
     if sess.status == 'completed':
         flash('This session is completed and cannot be resumed.', 'error')
         return redirect('/history')
+    elapsed_seconds = 0
     if sess.end_time:
-        sess.end_time = None
+        elapsed_seconds = (sess.end_time - sess.start_time).total_seconds()
+        sess.end_time = None  # Reset for resume
+        sess.status = 'ongoing'  # Back to ongoing
         db.session.commit()
     session['session_id'] = str(sid)
     # Reconstruct data
@@ -585,7 +589,7 @@ def resume_session(sid):
         valid_clusters = cluster_dict.get('valid_clusters', [])
     data = {
         'blobs': cluster_dict.get('blobs', []),
-        'start_time': time.time(),
+        'start_time': time.time() - elapsed_seconds,
         'deploy_count': sess.deploy_count,
         'total_distance': sess.total_distance,
         'prev_pos': None,
@@ -993,7 +997,7 @@ def end_session():
     if not sess:
         return redirect('/')
     if mode == 'pause':
-        sess.end_time = None
+        sess.end_time = datetime.now()  # CHANGED: Set end_time to now (capture pause point)
         sess.status = 'paused'
         db.session.commit()
         session.pop('session_id')
@@ -1001,7 +1005,7 @@ def end_session():
         CURRENT_IN_ZONE = False
         return redirect('/history')
     else:
-        # save/completed
+        # save/completed (unchanged, but see below for mission_time fix)
         sess.end_time = datetime.now()
         sess.status = 'completed'
         if data:
@@ -1192,7 +1196,7 @@ def end_session():
         deploys_data = [{'timestamp': dep.timestamp.strftime('%Y-%m-%d %H:%M:%S'), 'lat': dep.lat, 'lon': dep.lon, 'ultrasonic_distance': dep.ultrasonic_distance, 'cluster_id': dep.cluster_id} for dep in deployments]
         
         # Stats
-        mission_time = str(timedelta(seconds=int((datetime.now() - sess.start_time).total_seconds())))
+        mission_time = str(timedelta(seconds=int((sess.end_time - sess.start_time).total_seconds())))
         final_stats = {
             'mission_time': mission_time,
             'deploy_count': sess.deploy_count,
@@ -1403,13 +1407,13 @@ def history():
     sessions_query = ReefSession.query.order_by(ReefSession.start_time.desc()).all()
     sessions = []
     for s in sessions_query:
-        if s.status == 'completed':
+        if s.end_time:  # CHANGED: Use end_time presence for elapsed calculation
             duration_secs = (s.end_time - s.start_time).total_seconds()
             duration = f"{duration_secs / 3600:.1f}h"
-            status = 'Completed'
+            status = 'Completed' if s.status == 'completed' else 'Paused'  # Paused shows elapsed
         else:
-            duration = 'Ongoing' if s.status == 'ongoing' else 'Paused'
-            status = 'Ongoing' if s.status == 'ongoing' else 'Paused'
+            duration = 'Ongoing'
+            status = 'Ongoing'
         sessions.append({
             'id': s.id,
             'start_time': s.start_time.strftime('%Y-%m-%d %H:%M'),

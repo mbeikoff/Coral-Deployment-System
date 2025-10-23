@@ -30,7 +30,7 @@
                     {% if s.status != 'Completed' %}
                     <a href="/resume/{{ s.id }}" class="btn btn-primary btn-sm me-1">Resume</a>
                     {% endif %}
-                    <a href="/download_gpx?session_id={{ s.id }}" class="btn btn-secondary btn-sm me-1">Download GPX</a>
+                    <button onclick="downloadGPX({{ s.id }})" class="btn btn-secondary btn-sm me-1">Download GPX</button>
                     <button class="btn btn-danger btn-sm" onclick="deleteSession({{ s.id }})">Delete</button>
                 </div>
             </li>
@@ -39,6 +39,20 @@
         <a href="/" class="btn btn-secondary mt-3">Back to Home</a>
     </div>
     <script>
+        function downloadGPX(sid) {
+            var userFilename = prompt("Enter filename (without .gpx extension):", "");
+            var filename = "";
+            if (userFilename !== null && userFilename.trim() !== "") {
+                filename = userFilename.trim();
+            }
+            // If empty or canceled, filename="", backend will default to timestamp
+            var url = `/download_gpx?session_id=${sid}`;
+            if (filename) {
+                url += `&filename=${encodeURIComponent(filename)}`;
+            }
+            window.location.href = url;
+        }
+
         function deleteSession(sid) {
             if (confirm('Are you sure? This will permanently delete the session and all associated data (GPS logs, deployments).')) {
                 fetch(`/api/delete_session/${sid}`, {method: 'DELETE'})
