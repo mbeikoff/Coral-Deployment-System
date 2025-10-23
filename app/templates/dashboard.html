@@ -23,25 +23,6 @@
             border-top: 1px solid #dee2e6;
             box-shadow: 0 -2px 5px rgba(0,0,0,0.1);
         }
-        #cluster-panel {
-            max-height: 60vh;
-            overflow-y: auto;
-            border: 1px solid #dee2e6;
-        }
-        .cluster-badge {
-            width: 20px;
-            height: 20px;
-            display: inline-block;
-            border-radius: 50%;
-            margin-right: 8px;
-            vertical-align: middle;
-        }
-        #download-selected {
-            display: block;
-        }
-        #download-selected.hidden {
-            display: none;
-        }
         .gps-marker {
             background: transparent;
             border: none;
@@ -78,22 +59,6 @@
                     <div class="readout"><strong>Speed:</strong> <span id="speed">0 km/h</span></div>
                     <div class="readout"><strong>Depth:</strong> <span id="depth">20 m</span></div>
                     <div class="readout"><strong>Ultrasonic Distance:</strong> <span id="ultrasonic-distance">{{ stats.ultrasonic_distance }} cm</span></div>
-                </div>
-                <div id="cluster-panel" class="p-3 bg-light rounded">
-                    <h6>Clusters ({{ stats.blobs }})</h6>
-                    <ul id="cluster-list" class="list-unstyled">
-                        {% for info in cluster_info %}
-                        <li class="mb-2 form-check">
-                            <input class="form-check-input cluster-check" type="checkbox" data-cid="{{ info.cid }}" checked id="check-{{ info.cid }}">
-                            <label class="form-check-label" for="check-{{ info.cid }}">
-                                <span class="cluster-badge" style="background-color: {{ info.color }};"></span>
-                                Cluster {{ info.cid }} ({{ info.size }} pts)
-                                <br><small class="text-muted">Center: {{ info.center_lat }}, {{ info.center_lon }} | Area: {{ info.area_m2 }} m²</small>
-                            </label>
-                        </li>
-                        {% endfor %}
-                    </ul>
-                    <button id="download-selected" class="btn btn-success btn-sm w-100">Download Selected GPX</button>
                 </div>
             </div>
             <div class="col-md-9">
@@ -251,32 +216,13 @@
         });
     }, 1000);
 
-    // Cluster selection and toggle JS (runs after DOM ready)
+    // Wait for map to load and replay any stored GPS
     document.addEventListener('DOMContentLoaded', function() {
         console.log('DOM loaded');
-        const checks = document.querySelectorAll('.cluster-check');
-        const downloadBtn = document.getElementById('download-selected');
-        const sid = {{ sid }};
-
-        function updateDownloadButton() {
-            const selected = Array.from(checks).filter(c => c.checked).length;
-            if (selected > 0) {
-                downloadBtn.classList.remove('hidden');
-                downloadBtn.disabled = false;
-            } else {
-                downloadBtn.classList.add('hidden');
-                downloadBtn.disabled = true;
-            }
-        }
-
-        // Initial check
-        updateDownloadButton();
-
-        // Wait for map to load before attaching toggles AND replaying any stored GPS
         const mapCheckInterval = setInterval(function() {
             if (window.map) {
                 clearInterval(mapCheckInterval);
-                console.log('Map loaded, attaching toggles and checking for GPS replay');
+                console.log('Map loaded, checking for GPS replay');
                 
                 // Replay latest GPS if stored (fixes timing issue)
                 if (window.latestGps) {
@@ -285,52 +231,8 @@
                     // Optional: Clear after replay to avoid duplicates on next update
                     window.latestGps = null;
                 }
-                
-                attachToggleListeners();
             }
         }, 200);
-
-        function attachToggleListeners() {
-            checks.forEach(function(check) {
-                check.addEventListener('change', function() {
-                    const cid = this.dataset.cid;
-                    const checked = this.checked;
-                    const layer = window.overlayLayers[`Cluster ${cid}`];
-                    if (layer) {
-                        if (checked) {
-                            layer.addTo(window.map);  // Show the layer
-                        } else {
-                            window.map.removeLayer(layer);  // Hide the layer
-                        }
-                    } else {
-                        console.warn(`Layer for Cluster ${cid} not found in overlayLayers.`);
-                    }
-                    updateDownloadButton();
-                });
-            });
-        }
-
-        // Download handler
-        downloadBtn.addEventListener('click', function(e) {
-            e.preventDefault();
-            const selected = Array.from(checks).filter(c => c.checked)
-                .map(c => c.dataset.cid)
-                .join(',');
-            if (selected === '') {
-                alert('Please select at least one cluster to download.');
-                return;
-            }
-            // Prompt for file name
-            let filename = prompt('Enter GPX file name (without extension):', '');
-            if (!filename || filename.trim() === '') {
-                // Default to date-time
-                const now = new Date();
-                const pad = n => n.toString().padStart(2, '0');
-                filename = `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())}_${pad(now.getHours())}-${pad(now.getMinutes())}-${pad(now.getSeconds())}`;
-            }
-            // Trigger download via query param
-            window.location.href = `/download_gpx?selected=${selected}&filename=${encodeURIComponent(filename)}`;
-        });
 
         // End session modal handlers
         const endModal = new bootstrap.Modal(document.getElementById('endModal'));
@@ -338,6 +240,7 @@
             endModal.show();
         });
 
+        const sid = {{ sid }};
         document.getElementById('discard-btn').addEventListener('click', function() {
             if (confirm('Are you sure? This will permanently delete the session and all associated data.')) {
                 fetch(`/api/delete_session/${sid}`, {method: 'DELETE'})

@@ -229,10 +229,11 @@ def new_session():
         if file.filename == '':
             return render_template('new.html', error='No file selected')
         
-        eps = float(request.form.get('eps', 50.0))  # Default 50m for deploy threshold
-        min_samples = int(request.form.get('min_samples', 2))
-        min_cluster_size = int(request.form.get('min_cluster_size', 2))
-        hide_no_deploy = request.form.get('hide_no_deploy', 'on') == 'on'  # Checkbox default on (hide)
+        # Use defaults
+        eps = 5.0
+        min_samples = 2
+        min_cluster_size = 2
+        hide_no_deploy = True
         
         try:
             df = pd.read_csv(file)
@@ -241,7 +242,7 @@ def new_session():
             file_path = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
             file.save(file_path)
             
-            # Clustering (only on decision 2)
+            # Clustering with defaults (only on decision 2)
             deploy_df = df[df['patch_decision'] == 2].copy()
             if len(deploy_df) > 0:
                 coords = deploy_df[['patch_lon', 'patch_lat']].values
@@ -282,43 +283,8 @@ def new_session():
                 )
                 db.session.add(new_sess)
                 db.session.commit()
-                
-                session_id = str(new_sess.id)
-                session['session_id'] = session_id
-                
-                # Start session in memory
-                clusters_data[session_id] = {
-                    'blobs': blobs,
-                    'start_time': time.time(),
-                    'deploy_count': 0,
-                    'total_distance': 0.0,
-                    'prev_pos': None,
-                    'df': df,
-                    'eps': eps,
-                    'min_samples': min_samples,
-                    'min_cluster_size': min_cluster_size,
-                    'hide_no_deploy': hide_no_deploy,
-                    'labeled_deploy_df': labeled_deploy_df,
-                    'valid_clusters': valid_clusters
-                }
-                CURRENT_SESSION_ID = session_id
-                CURRENT_IN_ZONE = False
 
-                # --- Ultrasonic sensor initialization ---
-                if not ULTRASONIC_INITIALIZED:
-                    import Jetson.GPIO as _GPIO
-                    GPIO = _GPIO
-                    GPIO.setmode(GPIO.BOARD)
-                    GPIO.setup(TRIG_PIN, GPIO.OUT)
-                    GPIO.setup(ECHO_PIN, GPIO.IN)
-                    GPIO.output(TRIG_PIN, False)
-                    ULTRASONIC_INITIALIZED = True
-                    time.sleep(0.05)
-                    if ultrasonic_thread is None:
-                        ultrasonic_thread = threading.Thread(target=ultrasonic_monitor, daemon=True)
-                        ultrasonic_thread.start()
-
-                return redirect('/dashboard')
+                return redirect(f'/configure/{new_sess.id}')
             else:
                 return render_template('new.html', error='No deploy (2) points found!')
         except Exception as e:
@@ -326,9 +292,260 @@ def new_session():
     
     return render_template('new.html')
 
+@app.route('/configure/<int:sid>')
+def configure_session(sid):
+    sess = db.session.get(ReefSession, sid)
+    if sess is None:
+        abort(404)
+    
+    # Override with query params if provided
+    eps = float(request.args.get('eps', sess.eps or 50.0))
+    min_samples = int(request.args.get('min_samples', sess.min_samples or 2))
+    min_cluster_size = int(request.args.get('min_cluster_size', sess.min_cluster_size or 2))
+    hide_no_deploy = request.args.get('hide_no_deploy', 'on') == 'on'
+    
+    # Update session with new params
+    sess.eps = eps
+    sess.min_samples = min_samples
+    sess.min_cluster_size = min_cluster_size
+    sess.hide_no_deploy = hide_no_deploy
+    
+    # Recompute clusters
+    try:
+        if sess.df_json:
+            df = pd.read_json(sess.df_json, orient='records')
+        else:
+            csv_path = os.path.join(UPLOAD_FOLDER, sess.csv_filename)
+            if not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0:
+                raise ValueError("CSV file missing or empty")
+            df = pd.read_csv(csv_path)
+        if df.empty:
+            raise ValueError("Loaded data is empty")
+    except Exception as e:
+        flash(f"Error loading data: {str(e)}", 'error')
+        return redirect('/new')
+    
+    deploy_df = df[df['patch_decision'] == 2].copy()
+    valid_clusters = []
+    blobs = []
+    labeled_deploy_df = pd.DataFrame()
+    if len(deploy_df) > 0:
+        coords = deploy_df[['patch_lat', 'patch_lon']].values
+        dbscan = DBSCAN(eps=eps / 6371000, min_samples=min_samples, metric='haversine').fit(np.radians(coords))
+        labels = dbscan.labels_
+        deploy_df['cluster'] = labels
+        cluster_sizes = pd.Series(labels).value_counts()
+        valid_clusters = [c for c in cluster_sizes[cluster_sizes >= min_cluster_size].index if c != -1]
+        
+        labeled_deploy_df = deploy_df.copy()
+        
+        for cid in valid_clusters:
+            cluster_pts = labeled_deploy_df[labeled_deploy_df['cluster'] == cid][['patch_lat', 'patch_lon']].values
+            centre = cluster_pts.mean(axis=0)
+            blobs.append({'lat': centre[0], 'lon': centre[1], 'radius': eps})
+    
+    # Update session clusters_json
+    sess.clusters_json = json.dumps({
+        'blobs': blobs,
+        'labeled_deploy_df': labeled_deploy_df.to_json(orient='records'),
+        'valid_clusters': valid_clusters
+    })
+    db.session.commit()
+    
+    # Generate map
+    df_view = df.copy()
+    if hide_no_deploy:
+        df_view = df_view[df_view['patch_decision'] != 0].copy()
+    centre_lat = df_view['patch_lat'].mean() if not df_view.empty else 0
+    centre_lon = df_view['patch_lon'].mean() if not df_view.empty else 0
+    
+    # Prepare points data for JS
+    points_data = []
+    def get_colour(decision):
+        if decision == 0: return 'red'
+        if decision == 1: return 'green'
+        if decision == 2: return 'yellow'
+        return 'blue'
+    
+    for _, row in df_view.iterrows():
+        popup_escaped = str(row.get('patch_id', '')).replace("'", "\\'") + r"<br>Decision: " + str(row.get('patch_decision', '')).replace("'", "\\'") + r"<br>Depth: " + str(row.get('ping_depth', '')).replace("'", "\\'")
+        points_data.append({
+            'lat': row['patch_lat'],
+            'lon': row['patch_lon'],
+            'popup': popup_escaped,
+            'color': get_colour(row['patch_decision'])
+        })
+    
+    # Clusters
+    colors = ['red', 'blue', 'green', 'orange', 'purple', 'brown', 'pink', 'gray', 'olive', 'cyan']
+    cluster_info = []
+    cluster_layers_js = []
+    for i, cid in enumerate(valid_clusters):
+        color = colors[i % len(colors)]
+        cluster_pts = labeled_deploy_df[labeled_deploy_df['cluster'] == cid][['patch_lat', 'patch_lon']].values
+        size = len(cluster_pts)
+        if size > 0:
+            center_lat, center_lon = cluster_pts.mean(axis=0)
+            if size >= 3:
+                hull_input = cluster_pts[:, [1, 0]]  # lon, lat
+                hull = ConvexHull(hull_input)
+                vertices = cluster_pts[hull.vertices]
+                hull_pts = [Point(v[1], v[0]) for v in vertices]  # lat, lon
+                hull_poly = unary_union(hull_pts).convex_hull
+                gdf = gpd.GeoDataFrame({'geometry': [hull_poly]}, crs='EPSG:4326')
+                geojson = gdf.to_json()
+                geojson_escaped = geojson.replace("'", "\\'")
+                cluster_layers_js.append(f"""
+                var cluster{cid} = L.geoJSON(JSON.parse('{geojson_escaped}'), {{
+                    style: {{fillColor: '{color}', color: '{color}', weight: 3, fillOpacity: 0.4}},
+                    onEachFeature: function(feature, layer) {{
+                        layer.bindPopup("Cluster {cid}<br>Size: {size} points");
+                    }}
+                }});
+                window.overlayLayers['Cluster {cid}'] = cluster{cid};
+                """)
+                area_m2 = round(gdf.to_crs('EPSG:3857').area.iloc[0], 2)
+            else:
+                r_m = eps / 2
+                area_m2 = round(np.pi * r_m**2, 2)
+                r_deg = eps / 111000 * 57.3
+                cluster_layers_js.append(f"""
+                var cluster{cid} = L.circle([{center_lat}, {center_lon}], {{radius: {r_deg}, color: '{color}', weight: 3, fillColor: '{color}', fillOpacity: 0.4}})
+                    .bindPopup("Cluster {cid}<br>Size: {size} points");
+                window.overlayLayers['Cluster {cid}'] = cluster{cid};
+                """)
+            
+            cluster_info.append({
+                'cid': cid,
+                'size': size,
+                'center_lat': round(float(center_lat), 6),
+                'center_lon': round(float(center_lon), 6),
+                'area_m2': area_m2,
+                'color': color
+            })
+    
+    # Build static map
+    map_html = f"""
+    <div id="map" style="height: 80vh; width: 100%;"></div>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        var map = L.map('map').setView([{centre_lat}, {centre_lon}], 15);
+        L.tileLayer('https://api.maptiler.com/maps/satellite/{{z}}/{{x}}/{{y}}.png?key={API_KEY}', {{
+            attribution: '© MapTiler',
+            maxZoom: 22
+        }}).addTo(map);
+        
+        // Points layer
+        var pointsLayer = L.layerGroup();
+        {chr(10).join([f"L.circleMarker([{p['lat']}, {p['lon']}], {{radius: 3, color: '{p['color']}', fill: true, fillOpacity: 0.7}}).bindPopup('{p['popup']}').addTo(pointsLayer);" for p in points_data])}
+        pointsLayer.addTo(map);
+        window.overlayLayers = {{'Points': pointsLayer}};
+        
+        // Cluster layers
+        {chr(10).join(cluster_layers_js)}
+        
+        window.map = map;
+    </script>
+    <style>.deploy-marker {{ background: transparent; border: none; }}</style>
+    """
+    
+    stats = {
+        'blobs': len(cluster_info)
+    }
+    
+    return render_template('configure.html', map_html=map_html, stats=stats, cluster_info=cluster_info, sid=sid, sess=sess)
+
+@app.route('/start/<int:sid>')
+def start_session(sid):
+    global GPIO, ULTRASONIC_INITIALIZED, ultrasonic_thread, CURRENT_SESSION_ID, CURRENT_IN_ZONE
+    sess = db.session.get(ReefSession, sid)
+    if sess is None:
+        flash('Session not found.', 'error')
+        return redirect('/new')
+    session['session_id'] = str(sid)
+    # Reconstruct data
+    try:
+        # Prefer DF from JSON (resilient to file issues)
+        if sess.df_json:
+            df = pd.read_json(sess.df_json, orient='records')
+        else:
+            # Fallback to file
+            csv_path = os.path.join(UPLOAD_FOLDER, sess.csv_filename)
+            if not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0:
+                raise ValueError("CSV file missing or empty")
+            df = pd.read_csv(csv_path)
+        if df.empty:
+            raise ValueError("Loaded data is empty")
+    except Exception as e:
+        flash(f"Error starting session: Unable to load data - {str(e)}. Please re-upload if needed.", 'error')
+        return redirect('/new')
+    
+    cluster_dict = json.loads(sess.clusters_json or '{}')
+    try:
+        labeled_deploy_df = pd.read_json(cluster_dict['labeled_deploy_df'], orient='records')
+    except (KeyError, ValueError):
+        labeled_deploy_df = pd.DataFrame()
+        valid_clusters = []
+    else:
+        valid_clusters = cluster_dict.get('valid_clusters', [])
+    data = {
+        'blobs': cluster_dict.get('blobs', []),
+        'start_time': time.time(),
+        'deploy_count': sess.deploy_count,
+        'total_distance': sess.total_distance,
+        'prev_pos': None,
+        'df': df,
+        'eps': sess.eps,
+        'min_samples': sess.min_samples,
+        'min_cluster_size': sess.min_cluster_size,
+        'hide_no_deploy': sess.hide_no_deploy,
+        'labeled_deploy_df': labeled_deploy_df,
+        'valid_clusters': valid_clusters
+    }
+    clusters_data[str(sid)] = data
+    CURRENT_SESSION_ID = str(sid)
+    CURRENT_IN_ZONE = False
+
+    # --- Ultrasonic sensor initialization ---
+    if not ULTRASONIC_INITIALIZED:
+        import Jetson.GPIO as _GPIO
+        GPIO = _GPIO
+        GPIO.setmode(GPIO.BOARD)
+        GPIO.setup(TRIG_PIN, GPIO.OUT)
+        GPIO.setup(ECHO_PIN, GPIO.IN)
+        GPIO.output(TRIG_PIN, False)
+        ULTRASONIC_INITIALIZED = True
+        time.sleep(0.05)
+        if ultrasonic_thread is None:
+            ultrasonic_thread = threading.Thread(target=ultrasonic_monitor, daemon=True)
+            ultrasonic_thread.start()
+
+    return redirect('/dashboard')
+
+@app.route('/discard/<int:sid>')
+def discard_session(sid):
+    sess = db.session.get(ReefSession, sid)
+    if not sess:
+        flash('Session not found.', 'error')
+        return redirect('/new')
+    session_id = str(sid)
+    if session_id in clusters_data:
+        del clusters_data[session_id]
+    if session.get('session_id') == session_id:
+        session.pop('session_id')
+    global CURRENT_SESSION_ID, CURRENT_IN_ZONE
+    if CURRENT_SESSION_ID == session_id:
+        CURRENT_SESSION_ID = None
+        CURRENT_IN_ZONE = False
+    db.session.delete(sess)
+    db.session.commit()
+    flash('Session discarded.')
+    return redirect('/new')
+
 @app.route('/resume/<int:sid>')
 def resume_session(sid):
-    global CURRENT_SESSION_ID, CURRENT_IN_ZONE
+    global GPIO, ULTRASONIC_INITIALIZED, ultrasonic_thread, CURRENT_SESSION_ID, CURRENT_IN_ZONE
     sess = db.session.get(ReefSession, sid)
     if sess is None:
         flash('Session not found.', 'error')
@@ -368,7 +585,7 @@ def resume_session(sid):
         valid_clusters = cluster_dict.get('valid_clusters', [])
     data = {
         'blobs': cluster_dict.get('blobs', []),
-        'start_time': sess.start_time.timestamp(),
+        'start_time': time.time(),
         'deploy_count': sess.deploy_count,
         'total_distance': sess.total_distance,
         'prev_pos': None,
@@ -393,6 +610,21 @@ def resume_session(sid):
         CURRENT_IN_ZONE = min_dist <= data['eps']
     clusters_data[str(sid)] = data
     CURRENT_SESSION_ID = str(sid)
+
+    # --- Ultrasonic sensor initialization ---
+    if not ULTRASONIC_INITIALIZED:
+        import Jetson.GPIO as _GPIO
+        GPIO = _GPIO
+        GPIO.setmode(GPIO.BOARD)
+        GPIO.setup(TRIG_PIN, GPIO.OUT)
+        GPIO.setup(ECHO_PIN, GPIO.IN)
+        GPIO.output(TRIG_PIN, False)
+        ULTRASONIC_INITIALIZED = True
+        time.sleep(0.05)
+        if ultrasonic_thread is None:
+            ultrasonic_thread = threading.Thread(target=ultrasonic_monitor, daemon=True)
+            ultrasonic_thread.start()
+
     return redirect('/dashboard')
 
 @app.route('/view/<int:sid>')
@@ -995,8 +1227,8 @@ def dashboard():
     df = data['df']
     if data.get('hide_no_deploy', True):
         df = df[df['patch_decision'] != 0].copy()  # Filter out no-deploy points
-    centre_lat = df['centre_lat'].mean() if 'centre_lat' in df else df['center_lat'].mean()
-    centre_lon = df['centre_lon'].mean() if 'centre_lon' in df else df['center_lon'].mean()
+    centre_lat = df['patch_lat'].mean() if not df.empty else 0
+    centre_lon = df['patch_lon'].mean() if not df.empty else 0
     
     eps = data.get('eps', 50.0)
     min_samples = data.get('min_samples', 2)
@@ -1053,7 +1285,6 @@ def dashboard():
                         layer.bindPopup("Cluster {cid}<br>Size: {size} points");
                     }}
                 }}).addTo(map);
-                window.overlayLayers['Cluster {cid}'] = cluster{cid};
                 """)
                 area_m2 = round(gdf.to_crs('EPSG:3857').area.iloc[0], 2)
             else:
@@ -1066,7 +1297,6 @@ def dashboard():
                 var cluster{cid} = L.circle([{center_lat}, {center_lon}], {{radius: {r_deg}, color: '{color}', weight: 3, fillColor: '{color}', fillOpacity: 0.4}})
                     .bindPopup("Cluster {cid}<br>Size: {size} points")
                     .addTo(map);
-                window.overlayLayers['Cluster {cid}'] = cluster{cid};
                 """)
             
             cluster_info.append({
@@ -1090,7 +1320,6 @@ def dashboard():
         var historicalTrail = L.polyline([
         {points_js}
         ], {{color: 'gray', weight: 2, dashArray: '5,5', opacity: 0.6}}).addTo(map);
-        window.overlayLayers['Historical Trail'] = historicalTrail;
         """
     
     past_deploys_js = ""
@@ -1108,7 +1337,6 @@ def dashboard():
         var pastDeploysLayer = L.layerGroup();
         {dep_markers_js}
         pastDeploysLayer.addTo(map);
-        window.overlayLayers['Past Deployments'] = pastDeploysLayer;
         """
     
     # Build Leaflet map HTML/JS
@@ -1127,7 +1355,6 @@ def dashboard():
         var pointsLayer = L.layerGroup();
         {chr(10).join([f"L.circleMarker([{p['lat']}, {p['lon']}], {{radius: 3, color: '{p['color']}', fill: true, fillOpacity: 0.7}}).bindPopup('{p['popup']}').addTo(pointsLayer);" for p in points_data])}
         pointsLayer.addTo(map);
-        window.overlayLayers = {{'Points': pointsLayer}};
         
         // Cluster layers
         {chr(10).join(cluster_layers_js)}
@@ -1149,7 +1376,6 @@ def dashboard():
         // GPS layer for control
         var gpsLayer = L.layerGroup([gpsMarker]);
         gpsLayer.addTo(map);
-        window.overlayLayers['GPS'] = gpsLayer;
         
         window.map = map;
         window.gpsMarker = gpsMarker;
