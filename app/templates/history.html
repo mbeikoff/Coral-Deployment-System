@@ -9,8 +9,20 @@
     <div class="container mt-5">
         <h2>Session History</h2>
         <ul class="list-group">
-            {% for sid in sessions %}
-            <li class="list-group-item">{{ sid }} - <a href="/dashboard?sid={{ sid }}">Load</a></li>
+            {% for s in sessions %}
+            <li class="list-group-item d-flex justify-content-between align-items-center">
+                <div>
+                    <strong>ID: {{ s.id }}</strong> | Started: {{ s.start_time }}<br>
+                    <small class="text-muted">
+                        Duration: {{ s.duration }} | Deploys: {{ s.deploy_count }} | Distance: {{ s.total_distance }}
+                        {% if s.status == 'Ongoing' %}<span class="badge bg-warning ms-2">Ongoing</span>{% endif %}
+                    </small>
+                </div>
+                <div>
+                    <a href="/resume/{{ s.id }}" class="btn btn-primary btn-sm me-1">Resume</a>
+                    <a href="/download_gpx?session_id={{ s.id }}" class="btn btn-secondary btn-sm">Download GPX</a>
+                </div>
+            </li>
             {% endfor %}
         </ul>
         <a href="/" class="btn btn-secondary mt-3">Back to Home</a>

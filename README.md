@@ -22,16 +22,17 @@
 4. **Run the Docker container:**
     ```bash
     sudo docker run -it --rm \
-      --runtime=nvidia --gpus all \
-      --network=host --privileged \
-      --device=/dev/gpiochip0 --device=/dev/gpiochip1 --device=/dev/gpiochip2 \
-      -v /proc/device-tree/compatible:/proc/device-tree/compatible \
-      -v /proc/device-tree/chosen:/proc/device-tree/chosen \
-      -v /sys/devices/:/sys/devices/ \
-      -v /sys/firmware/devicetree:/sys/firmware/devicetree \
-      -v $PWD/output:/app/output \
-      -e JETSON_MODEL_NAME=JETSON_ORIN_NANO \
-      coraldeploy-local
+        --runtime=nvidia --gpus all \
+        --network=host --privileged \
+        --device=/dev/gpiochip0 --device=/dev/gpiochip1 --device=/dev/gpiochip2 \
+        -v /proc/device-tree/compatible:/proc/device-tree/compatible \
+        -v /proc/device-tree/chosen:/proc/device-tree/chosen \
+        -v /sys/devices/:/sys/devices/ \
+        -v /sys/firmware/devicetree:/sys/firmware/devicetree \
+        -v $PWD/output:/app/output \
+        -v $PWD/storage:/app/storage \
+        -e JETSON_MODEL_NAME=JETSON_ORIN_NANO \
+        coraldeploy-local
     ```
     Adjust volume mounts as needed for your outputs/uploads.
 

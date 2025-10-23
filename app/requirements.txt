@@ -12,3 +12,4 @@ eventlet
 gpxpy
 pyserial
 pynmea2
+flask_sqlalchemy

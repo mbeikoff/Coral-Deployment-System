@@ -1,7 +1,7 @@
 import eventlet
 eventlet.monkey_patch()
 
-from flask import Flask, render_template, request, jsonify, session, redirect, Response
+from flask import Flask, render_template, request, jsonify, session, redirect, Response, abort
 import pandas as pd
 import folium
 from sklearn.cluster import DBSCAN
@@ -14,6 +14,14 @@ import geopandas as gpd
 import os
 import serial
 import pynmea2
+import json
+from datetime import datetime, timedelta
+import uuid
+from flask_sqlalchemy import SQLAlchemy
+from flask_session import Session  # pip install flask-session
+from folium import Element
+from folium.plugins import MarkerCluster, LocateControl, Realtime
+from folium import JsCode
 
 # pip install gpxpy  # Add this for GPX export
 import gpxpy
@@ -81,10 +89,6 @@ from flask_socketio import SocketIO, emit
 import threading
 from api_key import API_KEY
 import io
-import time
-import json
-from datetime import datetime, timedelta
-from flask_session import Session  # pip install flask-session
 from folium import Element
 from folium.plugins import MarkerCluster, LocateControl, Realtime
 from folium import JsCode
@@ -93,10 +97,21 @@ from folium import JsCode
 app = Flask(__name__)
 app.secret_key = 'reefscan_secret'  # Change for prod
 app.config['SESSION_TYPE'] = 'filesystem'
+
+# Create storage folder
+STORAGE_FOLDER = os.path.abspath('storage')
+os.makedirs(STORAGE_FOLDER, exist_ok=True)
+
+# Database in storage with absolute path
+DB_PATH = os.path.join(STORAGE_FOLDER, 'reefscan.db')
+app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{DB_PATH}'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
 Session(app)
+db = SQLAlchemy(app)
 socketio = SocketIO(app)  # Removed engineio_logger to avoid the TypeError
 
-UPLOAD_FOLDER = 'uploads'
+UPLOAD_FOLDER = os.path.join(STORAGE_FOLDER, 'uploads')
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
@@ -112,7 +127,7 @@ ultrasonic_distance = 0.0
 DEPLOY_THRESHOLD = 15.0
 
 def ultrasonic_monitor():
-    global ultrasonic_distance, ULTRASONIC_INITIALIZED, CURRENT_SESSION_ID, CURRENT_IN_ZONE
+    global ultrasonic_distance, ULTRASONIC_INITIALIZED, CURRENT_SESSION_ID, CURRENT_IN_ZONE, gps_lat, gps_lon
     while ULTRASONIC_INITIALIZED:
         dist = get_ultrasonic_distance()
         ultrasonic_distance = dist
@@ -121,6 +136,31 @@ def ultrasonic_monitor():
         if dist > 0 and dist < DEPLOY_THRESHOLD and CURRENT_IN_ZONE and CURRENT_SESSION_ID in clusters_data:
             sess_data = clusters_data[CURRENT_SESSION_ID]
             sess_data['deploy_count'] += 1
+            # Find nearest cluster
+            min_dist_to_blob = float('inf')
+            nearest_cluster_id = None
+            for i, blob in enumerate(sess_data['blobs']):
+                blob_dist = haversine_dist(gps_lat or 0, gps_lon or 0, blob['lat'], blob['lon'])
+                if blob_dist < min_dist_to_blob:
+                    min_dist_to_blob = blob_dist
+                    nearest_cluster_id = sess_data['valid_clusters'][i]
+            # Log to DB
+            try:
+                sid = int(CURRENT_SESSION_ID)
+                deploy = Deployment(
+                    session_id=sid,
+                    timestamp=datetime.now(),
+                    lat=float(gps_lat) if gps_lat else None,
+                    lon=float(gps_lon) if gps_lon else None,
+                    ultrasonic_distance=dist,
+                    cluster_id=nearest_cluster_id
+                )
+                db.session.add(deploy)
+                sess = db.session.get(ReefSession, sid)
+                sess.deploy_count = sess_data['deploy_count']
+                db.session.commit()
+            except Exception as e:
+                print(f"Deployment log error: {e}")
             socketio.emit('deploy_event', {'message': 'Coral sample deployed!', 'distance': dist, 'deploy_count': sess_data['deploy_count']}, callback=lambda: None)
         time.sleep(0.05)  # 20Hz polling
 
@@ -131,6 +171,45 @@ def haversine_dist(lat1, lon1, lat2, lon2):
     a = np.sin(dlat/2)**2 + np.cos(np.radians(lat1)) * np.cos(np.radians(lat2)) * np.sin(dlon/2)**2
     c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1-a))
     return R * c
+
+# Database Models
+class ReefSession(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    session_key = db.Column(db.String(50), unique=True)
+    start_time = db.Column(db.DateTime)
+    end_time = db.Column(db.DateTime, nullable=True)
+    total_distance = db.Column(db.Float, default=0.0)
+    deploy_count = db.Column(db.Integer, default=0)
+    total_patches = db.Column(db.Integer)
+    csv_filename = db.Column(db.String(200))
+    eps = db.Column(db.Float)
+    min_samples = db.Column(db.Integer)
+    min_cluster_size = db.Column(db.Integer)
+    hide_no_deploy = db.Column(db.Boolean, default=True)
+    clusters_json = db.Column(db.Text)
+    gps_logs = db.relationship('GPSLog', backref='session', lazy=True, cascade='all, delete-orphan')
+    deployments = db.relationship('Deployment', backref='session', lazy=True, cascade='all, delete-orphan')
+
+class GPSLog(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    session_id = db.Column(db.Integer, db.ForeignKey('reef_session.id'))
+    timestamp = db.Column(db.DateTime)
+    lat = db.Column(db.Float)
+    lon = db.Column(db.Float)
+    speed = db.Column(db.Float, default=0.0)
+    depth = db.Column(db.Float, default=20.0)
+    qual = db.Column(db.Integer)
+    sats = db.Column(db.Integer)
+    hdop = db.Column(db.Float)
+
+class Deployment(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    session_id = db.Column(db.Integer, db.ForeignKey('reef_session.id'))
+    timestamp = db.Column(db.DateTime)
+    lat = db.Column(db.Float, nullable=True)
+    lon = db.Column(db.Float, nullable=True)
+    ultrasonic_distance = db.Column(db.Float)
+    cluster_id = db.Column(db.Integer, nullable=True)
 
 @app.route('/')
 def landing():
@@ -157,8 +236,8 @@ def new_session():
             deploy_df = df[df['patch_decision'] == 2].copy()
             if len(deploy_df) > 0:
                 coords = deploy_df[['patch_lon', 'patch_lat']].values
-                db = DBSCAN(eps=eps / 6371000, min_samples=min_samples, metric='haversine').fit(np.radians(coords))
-                deploy_df['cluster'] = db.labels_
+                dbscan = DBSCAN(eps=eps / 6371000, min_samples=min_samples, metric='haversine').fit(np.radians(coords))
+                deploy_df['cluster'] = dbscan.labels_
                 cluster_sizes = deploy_df['cluster'].value_counts()
                 valid_clusters = [c for c in cluster_sizes[cluster_sizes >= min_cluster_size].index if c != -1]
                 
@@ -172,8 +251,31 @@ def new_session():
                     centre = cluster_pts.mean(axis=0)
                     blobs.append({'lat': centre[0], 'lon': centre[1], 'radius': eps})  # For distance calc
                 
-                # Start session
-                session_id = str(time.time())
+                # Create session in DB
+                new_sess = ReefSession(
+                    session_key=str(uuid.uuid4()),
+                    start_time=datetime.now(),
+                    total_distance=0.0,
+                    deploy_count=0,
+                    total_patches=len(df),
+                    csv_filename=file.filename,
+                    eps=eps,
+                    min_samples=min_samples,
+                    min_cluster_size=min_cluster_size,
+                    hide_no_deploy=hide_no_deploy,
+                    clusters_json=json.dumps({
+                        'blobs': blobs,
+                        'labeled_deploy_df': labeled_deploy_df.to_json(orient='records'),
+                        'valid_clusters': valid_clusters
+                    })
+                )
+                db.session.add(new_sess)
+                db.session.commit()
+                
+                session_id = str(new_sess.id)
+                session['session_id'] = session_id
+                
+                # Start session in memory
                 clusters_data[session_id] = {
                     'blobs': blobs,
                     'start_time': time.time(),
@@ -188,7 +290,6 @@ def new_session():
                     'labeled_deploy_df': labeled_deploy_df,
                     'valid_clusters': valid_clusters
                 }
-                session['session_id'] = session_id
                 CURRENT_SESSION_ID = session_id
                 CURRENT_IN_ZONE = False
 
@@ -214,15 +315,67 @@ def new_session():
     
     return render_template('new.html')
 
+@app.route('/resume/<int:sid>')
+def resume_session(sid):
+    global CURRENT_SESSION_ID, CURRENT_IN_ZONE
+    sess = db.session.get(ReefSession, sid)
+    if sess is None:
+        abort(404)
+    if sess.end_time:
+        sess.end_time = None
+        db.session.commit()
+    session['session_id'] = str(sid)
+    # Reconstruct data
+    cluster_dict = json.loads(sess.clusters_json or '{}')
+    df = pd.read_csv(os.path.join(UPLOAD_FOLDER, sess.csv_filename))
+    labeled_deploy_df = pd.read_json(cluster_dict['labeled_deploy_df'], orient='records')
+    data = {
+        'blobs': cluster_dict['blobs'],
+        'start_time': sess.start_time.timestamp(),
+        'deploy_count': sess.deploy_count,
+        'total_distance': sess.total_distance,
+        'prev_pos': None,
+        'df': df,
+        'eps': sess.eps,
+        'min_samples': sess.min_samples,
+        'min_cluster_size': sess.min_cluster_size,
+        'hide_no_deploy': sess.hide_no_deploy,
+        'labeled_deploy_df': labeled_deploy_df,
+        'valid_clusters': cluster_dict['valid_clusters']
+    }
+    # Set prev_pos from last log
+    last_log = GPSLog.query.filter_by(session_id=sid).order_by(GPSLog.timestamp.desc()).first()
+    if last_log:
+        data['prev_pos'] = (last_log.lat, last_log.lon)
+        # Set initial zone
+        min_dist = float('inf')
+        prev_lat, prev_lon = data['prev_pos']
+        for blob in data['blobs']:
+            dist = haversine_dist(prev_lat, prev_lon, blob['lat'], blob['lon'])
+            min_dist = min(min_dist, dist)
+        CURRENT_IN_ZONE = min_dist <= data['eps']
+    clusters_data[str(sid)] = data
+    CURRENT_SESSION_ID = str(sid)
+    return redirect('/dashboard')
+
 @app.route('/dashboard')
 def dashboard():
     if 'session_id' not in session:
         return redirect('/new')
     
     session_id = session['session_id']
+    sid = int(session_id)
+    sess = db.session.get(ReefSession, sid)
+    if sess is None:
+        return redirect('/new')
+    
     data = clusters_data.get(session_id, {})
     if not data:
         return redirect('/new')
+    
+    # Sync from DB if needed
+    data['deploy_count'] = sess.deploy_count
+    data['total_distance'] = sess.total_distance
     
     # Generate map as Leaflet HTML/JS string (no Folium)
     df = data['df']
@@ -286,7 +439,7 @@ def dashboard():
                         layer.bindPopup("Cluster {cid}<br>Size: {size} points");
                     }}
                 }}).addTo(map);
-                overlayLayers['Cluster {cid}'] = cluster{cid};
+                window.overlayLayers['Cluster {cid}'] = cluster{cid};
                 """)
                 area_m2 = round(gdf.to_crs('EPSG:3857').area.iloc[0], 2)
             else:
@@ -299,7 +452,7 @@ def dashboard():
                 var cluster{cid} = L.circle([{center_lat}, {center_lon}], {{radius: {r_deg}, color: '{color}', weight: 3, fillColor: '{color}', fillOpacity: 0.4}})
                     .bindPopup("Cluster {cid}<br>Size: {size} points")
                     .addTo(map);
-                overlayLayers['Cluster {cid}'] = cluster{cid};
+                window.overlayLayers['Cluster {cid}'] = cluster{cid};
                 """)
             
             cluster_info.append({
@@ -310,6 +463,39 @@ def dashboard():
                 'area_m2': area_m2,
                 'color': color
             })
+    
+    # Load historical data for map
+    gps_logs = GPSLog.query.filter_by(session_id=sid).order_by(GPSLog.timestamp).all()
+    deployments = Deployment.query.filter_by(session_id=sid).all()
+    
+    # Build conditional JS parts
+    historical_trail_js = ""
+    if gps_logs:
+        points_js = chr(10).join([f"[{log.lat}, {log.lon}]," for log in gps_logs])
+        historical_trail_js = f"""
+        var historicalTrail = L.polyline([
+        {points_js}
+        ], {{color: 'gray', weight: 2, dashArray: '5,5', opacity: 0.6}}).addTo(map);
+        window.overlayLayers['Historical Trail'] = historicalTrail;
+        """
+    
+    past_deploys_js = ""
+    if deployments:
+        dep_markers_js = chr(10).join([f"""
+        var depMarker{dep.id} = L.marker([{dep.lat}, {dep.lon}], {{
+            icon: L.divIcon({{
+                className: 'deploy-marker',
+                html: '<div style="background: orange; width: 16px; height: 16px; border-radius: 50%; border: 2px solid white;"></div>'
+            }})
+        }}).bindPopup('Past Deployment<br>Time: {dep.timestamp.strftime("%H:%M:%S")}<br>Dist: {dep.ultrasonic_distance} cm{"<br>Cluster: " + str(dep.cluster_id) if dep.cluster_id else ""}');
+        pastDeploysLayer.addLayer(depMarker{dep.id});
+        """ for dep in deployments])
+        past_deploys_js = f"""
+        var pastDeploysLayer = L.layerGroup();
+        {dep_markers_js}
+        pastDeploysLayer.addTo(map);
+        window.overlayLayers['Past Deployments'] = pastDeploysLayer;
+        """
     
     # Build Leaflet map HTML/JS
     map_html = f"""
@@ -327,10 +513,16 @@ def dashboard():
         var pointsLayer = L.layerGroup();
         {chr(10).join([f"L.circleMarker([{p['lat']}, {p['lon']}], {{radius: 3, color: '{p['color']}', fill: true, fillOpacity: 0.7}}).bindPopup('{p['popup']}').addTo(pointsLayer);" for p in points_data])}
         pointsLayer.addTo(map);
-        var overlayLayers = {{'Points': pointsLayer}};
+        window.overlayLayers = {{'Points': pointsLayer}};
         
         // Cluster layers
         {chr(10).join(cluster_layers_js)}
+        
+        // Historical trail
+        {historical_trail_js}
+        
+        // Past deployments
+        {past_deploys_js}
         
         // GPS marker (direct Leaflet marker)
         var gpsMarker = L.marker([{centre_lat}, {centre_lon}], {{
@@ -343,17 +535,14 @@ def dashboard():
         // GPS layer for control
         var gpsLayer = L.layerGroup([gpsMarker]);
         gpsLayer.addTo(map);
-        overlayLayers['GPS'] = gpsLayer;
-        
-        // Layer control
-        L.control.layers(null, overlayLayers).addTo(map);
+        window.overlayLayers['GPS'] = gpsLayer;
         
         window.map = map;
         window.gpsMarker = gpsMarker;
         console.log('Map assigned to window.map');
         console.log('GPS Marker assigned to window.gpsMarker');
     </script>
-    <style>.gps-marker {{ background: transparent; border: none; }}</style>
+    <style>.gps-marker {{ background: transparent; border: none; }} .deploy-marker {{ background: transparent; border: none; }}</style>
     """
     
     # Stats for dashboard
@@ -363,11 +552,11 @@ def dashboard():
     stats = {
         'mission_time': mission_time,
         'deploy_count': data['deploy_count'],
-        'total': len(df),
+        'total': sess.total_patches,
         'blobs': len(cluster_info),
         'ultrasonic_distance': ultrasonic_distance
     }
-    return render_template('dashboard.html', map_html=map_html, stats=stats, cluster_info=cluster_info)
+    return render_template('dashboard.html', map_html=map_html, stats=stats, cluster_info=cluster_info, gps_logs=gps_logs, deployments=deployments)
 
 # API endpoint for live ultrasonic sensor data
 @app.route('/api/ultrasonic')
@@ -380,77 +569,81 @@ def ultrasonic_api():
 
 @app.route('/download_gpx')
 def download_gpx():
-    if 'session_id' not in session:
+    session_id = request.args.get('session_id') or session.get('session_id')
+    if not session_id:
         return redirect('/new')
     
-    session_id = session['session_id']
-    data = clusters_data.get(session_id, {})
-    if not data:
-        return redirect('/new')
-    
-    labeled_deploy_df = data['labeled_deploy_df']
-    valid_clusters = data['valid_clusters']
-    
-    # Filter by selected if provided
     selected_str = request.args.get('selected', None)
-    if selected_str:
-        try:
-            selected = [int(c.strip()) for c in selected_str.split(',') if c.strip()]
-            valid_clusters = [c for c in valid_clusters if c in selected]
-        except ValueError:
-            pass  # Invalid, fall back to all
-    
-    print(f"DEBUG: Starting GPX export for {len(valid_clusters)} clusters (selected: {selected_str})")  # Console log
-    
-    gpx = gpxpy.gpx.GPX()
-    route_count = 0
-    
-    for cid in valid_clusters:
-        try:
-            cluster_pts = labeled_deploy_df[labeled_deploy_df['cluster'] == cid][['patch_lat', 'patch_lon']].values  # [lat, lon]
-            route_name = f"Cluster {cid} (size: {len(cluster_pts)})"
-            route = gpxpy.gpx.GPXRoute(name=route_name, description=f"Convex hull boundary for cluster {cid}")
-            
-            if len(cluster_pts) >= 3:
-                hull_input = cluster_pts[:, [1, 0]]  # [lon, lat] for ConvexHull
-                hull = ConvexHull(hull_input)
-                ordered_cluster_pts = cluster_pts[hull.vertices]  # ordered [lat, lon]
-                for lat, lon in ordered_cluster_pts:
-                    rtept = gpxpy.gpx.GPXRoutePoint(latitude=lat, longitude=lon)
-                    route.points.append(rtept)
-                # Close the route for a polygon-like boundary
-                if len(route.points) > 0:
-                    route.points.append(route.points[0])
-            else:
-                # For small clusters, add all points (no hull)
-                for lat, lon in cluster_pts:
-                    rtept = gpxpy.gpx.GPXRoutePoint(latitude=lat, longitude=lon)
-                    route.points.append(rtept)
-            
-            gpx.routes.append(route)
-            route_count += 1
-            print(f"DEBUG: Added route for cluster {cid} ({len(route.points)} points)")
-        except Exception as e:
-            print(f"DEBUG: Skipped cluster {cid} due to error: {e}")
-            continue  # Skip bad cluster but continue with others
-    
-    print(f"DEBUG: GPX export complete with {route_count} routes")  # Final log
-    
-    xml = gpx.to_xml()
-    
-    # FIXED: Use the provided filename query param, default to timestamp if empty
-    filename = request.args.get('filename', None)
-    if not filename:
-        from datetime import datetime
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        filename = f"clusters_{timestamp}"
-    filename += '.gpx'
-    
-    return Response(
-        xml,
-        mimetype="application/gpx+xml",
-        headers={"Content-disposition": f"attachment; filename={filename}"}
-    )
+    try:
+        sid = int(session_id)
+        sess = db.session.get(ReefSession, sid)
+        if sess is None:
+            return redirect('/new')
+        
+        cluster_dict = json.loads(sess.clusters_json or '{}')
+        labeled_deploy_df = pd.read_json(cluster_dict['labeled_deploy_df'], orient='records')
+        valid_clusters = cluster_dict['valid_clusters']
+        
+        # Filter by selected if provided
+        if selected_str:
+            try:
+                selected = [int(c.strip()) for c in selected_str.split(',') if c.strip()]
+                valid_clusters = [c for c in valid_clusters if c in selected]
+            except ValueError:
+                pass  # Invalid, fall back to all
+        
+        print(f"DEBUG: Starting GPX export for {len(valid_clusters)} clusters (selected: {selected_str})")  # Console log
+        
+        gpx = gpxpy.gpx.GPX()
+        route_count = 0
+        
+        for cid in valid_clusters:
+            try:
+                cluster_pts = labeled_deploy_df[labeled_deploy_df['cluster'] == cid][['patch_lat', 'patch_lon']].values  # [lat, lon]
+                route_name = f"Cluster {cid} (size: {len(cluster_pts)})"
+                route = gpxpy.gpx.GPXRoute(name=route_name, description=f"Convex hull boundary for cluster {cid}")
+                
+                if len(cluster_pts) >= 3:
+                    hull_input = cluster_pts[:, [1, 0]]  # [lon, lat] for ConvexHull
+                    hull = ConvexHull(hull_input)
+                    ordered_cluster_pts = cluster_pts[hull.vertices]  # ordered [lat, lon]
+                    for lat, lon in ordered_cluster_pts:
+                        rtept = gpxpy.gpx.GPXRoutePoint(latitude=lat, longitude=lon)
+                        route.points.append(rtept)
+                    # Close the route for a polygon-like boundary
+                    if len(route.points) > 0:
+                        route.points.append(route.points[0])
+                else:
+                    # For small clusters, add all points (no hull)
+                    for lat, lon in cluster_pts:
+                        rtept = gpxpy.gpx.GPXRoutePoint(latitude=lat, longitude=lon)
+                        route.points.append(rtept)
+                
+                gpx.routes.append(route)
+                route_count += 1
+                print(f"DEBUG: Added route for cluster {cid} ({len(route.points)} points)")
+            except Exception as e:
+                print(f"DEBUG: Skipped cluster {cid} due to error: {e}")
+                continue  # Skip bad cluster but continue with others
+        
+        print(f"DEBUG: GPX export complete with {route_count} routes")  # Final log
+        
+        xml = gpx.to_xml()
+        
+        # FIXED: Use the provided filename query param, default to timestamp if empty
+        filename = request.args.get('filename', None)
+        if not filename:
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            filename = f"clusters_{timestamp}"
+        filename += '.gpx'
+        
+        return Response(
+            xml,
+            mimetype="application/gpx+xml",
+            headers={"Content-disposition": f"attachment; filename={filename}"}
+        )
+    except ValueError:
+        return redirect('/new')
 
 @app.route('/end_session')
 def end_session():
@@ -458,24 +651,57 @@ def end_session():
     if 'session_id' in session:
         session_id = session['session_id']
         data = clusters_data.pop(session_id, None)
+        sid = int(session_id)
+        sess = db.session.get(ReefSession, sid)
+        if sess:
+            sess.end_time = datetime.now()
+            sess.total_distance = data.get('total_distance', sess.total_distance) if data else sess.total_distance
+            sess.deploy_count = data.get('deploy_count', sess.deploy_count) if data else sess.deploy_count
+            if data:
+                sess.clusters_json = json.dumps({
+                    'blobs': data['blobs'],
+                    'labeled_deploy_df': data['labeled_deploy_df'].to_json(orient='records'),
+                    'valid_clusters': data['valid_clusters']
+                })
+            db.session.commit()
         session.pop('session_id')
         CURRENT_SESSION_ID = None
         CURRENT_IN_ZONE = False
-        if data:
+        if sess:
+            mission_time = str(timedelta(seconds=int((datetime.now() - sess.start_time).total_seconds())))
+            cluster_dict = json.loads(sess.clusters_json or '{}')
             final_stats = {
-                'mission_time': str(timedelta(seconds=int(time.time() - data['start_time']))),
-                'deploy_count': data['deploy_count'],
-                'total_distance': f"{data['total_distance']:.2f} km",
-                'total_patches': len(data['df']),
-                'blobs': len(data['blobs'])
+                'mission_time': mission_time,
+                'deploy_count': sess.deploy_count,
+                'total_distance': f"{sess.total_distance:.2f} km",
+                'total_patches': sess.total_patches,
+                'blobs': len(cluster_dict.get('valid_clusters', []))
             }
             return render_template('summary.html', stats=final_stats)
     return redirect('/')
 
 @app.route('/history')
 def history():
-    # Placeholder: List past sessions
-    return render_template('history.html', sessions=list(clusters_data.keys()))  # Demo keys
+    sessions_query = ReefSession.query.order_by(ReefSession.start_time.desc()).all()
+    sessions = []
+    for s in sessions_query:
+        duration = None
+        status = 'Ongoing'
+        if s.end_time:
+            duration_secs = (s.end_time - s.start_time).total_seconds()
+            duration = f"{duration_secs / 3600:.1f}h"
+            status = 'Ended'
+        else:
+            duration = 'Ongoing'
+        sessions.append({
+            'id': s.id,
+            'start_time': s.start_time.strftime('%Y-%m-%d %H:%M'),
+            'duration': duration,
+            'deploy_count': s.deploy_count,
+            'total_distance': f"{s.total_distance:.2f} km" if s.total_distance else "0 km",
+            'status': status
+        })
+    return render_template('history.html', sessions=sessions)
 
 @app.route('/help')
 def help_page():
@@ -560,10 +786,11 @@ MIN_QUAL = 2  # >=2: DGPS/RTK
 
 gps_lat = None
 gps_lon = None
+current_speed = 0.0
 latest_gps = None
 
 def gps_monitor():
-    global gps_lat, gps_lon, latest_gps, CURRENT_IN_ZONE, CURRENT_SESSION_ID
+    global gps_lat, gps_lon, current_speed, latest_gps, CURRENT_IN_ZONE, CURRENT_SESSION_ID
     try:
         ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=TIMEOUT)
     except Exception as e:
@@ -576,7 +803,11 @@ def gps_monitor():
             if raw_line:
                 try:
                     line = raw_line.decode('ascii', errors='replace').strip()
-                    if line.startswith('$GNGGA') or line.startswith('$GGA'):
+                    if line.startswith('$GPVTG'):
+                        msg = pynmea2.parse(line)
+                        if hasattr(msg, 'spd_over_grnd_kmh') and msg.spd_over_grnd_kmh:
+                            current_speed = float(msg.spd_over_grnd_kmh)
+                    elif line.startswith('$GNGGA') or line.startswith('$GGA'):
                         msg = pynmea2.parse(line)
                         if isinstance(msg, pynmea2.GGA):
                             qual = int(msg.gps_qual)
@@ -590,7 +821,8 @@ def gps_monitor():
                                     'lon': gps_lon,
                                     'qual': qual,
                                     'sats': sats,
-                                    'hdop': hdop
+                                    'hdop': hdop,
+                                    'speed': current_speed
                                 }
                                 if CURRENT_SESSION_ID and CURRENT_SESSION_ID in clusters_data:
                                     sess_data = clusters_data[CURRENT_SESSION_ID]
@@ -611,13 +843,33 @@ def gps_monitor():
                                     
                                     CURRENT_IN_ZONE = in_deploy_zone
                                     
+                                    # Log to DB
+                                    try:
+                                        log = GPSLog(
+                                            session_id=int(CURRENT_SESSION_ID),
+                                            timestamp=datetime.now(),
+                                            lat=float(gps_lat),
+                                            lon=float(gps_lon),
+                                            speed=current_speed,
+                                            depth=20.0,
+                                            qual=qual,
+                                            sats=sats,
+                                            hdop=hdop
+                                        )
+                                        db.session.add(log)
+                                        db_sess = db.session.get(ReefSession, int(CURRENT_SESSION_ID))
+                                        db_sess.total_distance = sess_data['total_distance']
+                                        db.session.commit()
+                                    except Exception as e:
+                                        print(f"GPS log error: {e}")
+                                    
                                     emit_data.update({
                                         'status': 'DEPLOY' if in_deploy_zone else "DON'T DEPLOY",
                                         'color': 'green' if in_deploy_zone else 'red',
                                         'min_dist': min_dist,
                                         'total_distance': sess_data['total_distance'],
                                         'deploy_count': sess_data['deploy_count'],
-                                        'speed': 0,
+                                        'speed': current_speed,
                                         'depth': 20.0
                                     })
                                 else:
@@ -627,7 +879,7 @@ def gps_monitor():
                                         'min_dist': None,
                                         'total_distance': 0,
                                         'deploy_count': 0,
-                                        'speed': 0,
+                                        'speed': current_speed,
                                         'depth': 0
                                     })
                                 socketio.emit('gps_position_update', emit_data)
@@ -643,6 +895,8 @@ import threading
 threading.Thread(target=gps_monitor, daemon=True).start()
 
 if __name__ == '__main__':
+    with app.app_context():
+        db.create_all()
     try:
         # Set log_output=True to show the server address (and other startup info)
         socketio.run(app, debug=True, log_output=True)

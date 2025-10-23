@@ -46,6 +46,10 @@
             background: transparent;
             border: none;
         }
+        .deploy-marker {
+            background: transparent;
+            border: none;
+        }
     </style>
 </head>
 <body>
@@ -131,8 +135,9 @@
             console.log('Updating map with GPS:', data.lat, data.lon);  // Debug log
             // Update GPS marker directly
             window.gpsMarker.setLatLng([data.lat, data.lon]);
+            // Optionally update popup content silently
             window.gpsMarker.getPopup().setContent(`GPS Position<br>Lat: ${data.lat}<br>Lon: ${data.lon}<br>Quality: ${data.qual}`);
-            window.gpsMarker.openPopup();
+            // REMOVED: window.gpsMarker.openPopup();  // No auto-open
 
             // Lazy init trail and add point (Leaflet LatLng is [lat, lon])
             if (!window.gpsTrail) {
@@ -266,25 +271,15 @@
                 check.addEventListener('change', function() {
                     const cid = this.dataset.cid;
                     const checked = this.checked;
-                    // Find and toggle layer by name
-                    if (window.map && window.map.eachLayer) {
-                        function findAndToggle(layer) {
-                            if (layer.options && layer.options.name === `Cluster ${cid}`) {
-                                if (checked) {
-                                    window.map.addLayer(layer);
-                                } else {
-                                    window.map.removeLayer(layer);
-                                }
-                                return true;
-                            }
-                            if (layer.getLayers && layer.getLayers().length > 0) {
-                                for (let child of layer.getLayers()) {
-                                    if (findAndToggle(child)) return true;
-                                }
-                            }
-                            return false;
+                    const layer = window.overlayLayers[`Cluster ${cid}`];
+                    if (layer) {
+                        if (checked) {
+                            layer.addTo(window.map);  // Show the layer
+                        } else {
+                            window.map.removeLayer(layer);  // Hide the layer
                         }
-                        window.map.eachLayer(findAndToggle);
+                    } else {
+                        console.warn(`Layer for Cluster ${cid} not found in overlayLayers.`);
                     }
                     updateDownloadButton();
                 });
