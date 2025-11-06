@@ -7,14 +7,14 @@
 </head>
 <body class="bg-light">
     <div class="container mt-5">
-        <h2>New Session: Upload CSV</h2>
+        <h2>New Session: Upload CSV or GPX</h2>
         {% if error %}
             <div class="alert alert-danger">{{ error }}</div>
         {% endif %}
         <form method="post" enctype="multipart/form-data">
             <div class="mb-3">
-                <label for="file" class="form-label">CSV File:</label>
-                <input type="file" class="form-control" id="file" name="file" accept=".csv" required>
+                <label for="file" class="form-label">File:</label>
+                <input type="file" class="form-control" id="file" name="file" accept=".csv,.gpx" required>
             </div>
             <button type="submit" class="btn btn-primary mt-3">Upload and Configure</button>
             <a href="/" class="btn btn-secondary mt-3">Back to Home</a>

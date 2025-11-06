@@ -8,7 +8,7 @@
         #map-legend { position: absolute; top: 18px; right: 28px; z-index: 2000; }
         .cluster-panel { max-height: 40vh; overflow-y: auto; border: 1px solid #dee2e6; }
         .cluster-badge { width: 20px; height: 20px; display: inline-block; border-radius: 50%; margin-right: 8px; vertical-align: middle; }
-        #download-selected.hidden { display: none; }
+        #download-selected.hidden, #generate-paths.hidden, #download-path-gpx.hidden { display: none; }
         .deploy-marker { background: transparent; border: none; }
     </style>
 </head>
@@ -30,6 +30,7 @@
             <div class="col-md-3">
                 <h3>Session Configuration</h3>
                 <form method="GET" action="/configure/{{ sid }}">
+                    {% if sess.file_type == 'csv' %}
                     <div class="row">
                         <div class="col-6">
                             <label for="eps" class="form-label">Eps (m):</label>
@@ -44,11 +45,14 @@
                             <input type="number" class="form-control" id="min_cluster_size" name="min_cluster_size" value="{{ sess.min_cluster_size }}" min="1" required>
                         </div>
                     </div>
+                    {% endif %}
                     <div class="form-check mt-2">
                         <input class="form-check-input" type="checkbox" name="hide_no_deploy" id="hide-no-deploy" {% if sess.hide_no_deploy %}checked{% endif %}>
                         <label class="form-check-label" for="hide-no-deploy">Hide No-Deploy Points</label>
                     </div>
+                    {% if sess.file_type == 'csv' %}
                     <button type="submit" class="btn btn-info w-100 mt-2">Update Preview</button>
+                    {% endif %}
                 </form>
                 <hr>
                 <h6>Total Patches: {{ sess.total_patches }}</h6>
@@ -70,9 +74,17 @@
                             </li>
                             {% endfor %}
                         </ul>
-                        <button id="download-selected" class="btn btn-success btn-sm w-100">Download Selected GPX</button>
                     {% endif %}
                 </div>
+                {% if stats.blobs > 0 %}
+                <div class="mt-2">
+                    <label for="min-area" class="form-label small">Min Area for Paths (m²):</label>
+                    <input type="number" class="form-control form-control-sm" id="min-area" value="10" min="0" step="0.1">
+                </div>
+                <button id="download-selected" class="btn btn-success btn-sm w-100 mt-1">Download Selected GPX (Boundaries)</button>
+                <button id="generate-paths" class="btn btn-warning btn-sm w-100 mt-1">Generate Paths on Map</button>
+                <button id="download-path-gpx" class="btn btn-success btn-sm w-100 mt-1 hidden">Download Path GPX</button>
+                {% endif %}
                 <div class="mt-3">
                     <a href="/start/{{ sid }}" class="btn btn-primary w-100 mb-2">Start Session</a>
                     <a href="/discard/{{ sid }}" class="btn btn-danger w-100" onclick="return confirm('Discard this session? All data will be lost.');">Discard</a>
@@ -89,17 +101,31 @@
     document.addEventListener('DOMContentLoaded', function() {
         console.log('DOM loaded');
         const checks = document.querySelectorAll('.cluster-check');
-        const downloadBtn = document.getElementById('download-selected');
+        const downloadBoundariesBtn = document.getElementById('download-selected');
+        const generatePathsBtn = document.getElementById('generate-paths');
+        const downloadPathGpxBtn = document.getElementById('download-path-gpx');
         const sid = {{ sid }};
+        window.pathLayer = null;
 
         function updateDownloadButton() {
             const selected = Array.from(checks).filter(c => c.checked).length;
             if (selected > 0) {
-                downloadBtn.classList.remove('hidden');
-                downloadBtn.disabled = false;
+                downloadBoundariesBtn.classList.remove('hidden');
+                downloadBoundariesBtn.disabled = false;
+                if (generatePathsBtn) {
+                    generatePathsBtn.classList.remove('hidden');
+                    generatePathsBtn.disabled = false;
+                }
             } else {
-                downloadBtn.classList.add('hidden');
-                downloadBtn.disabled = true;
+                downloadBoundariesBtn.classList.add('hidden');
+                downloadBoundariesBtn.disabled = true;
+                if (generatePathsBtn) {
+                    generatePathsBtn.classList.add('hidden');
+                    generatePathsBtn.disabled = true;
+                }
+                if (downloadPathGpxBtn) {
+                    downloadPathGpxBtn.classList.add('hidden');
+                }
             }
         }
 
@@ -145,9 +171,9 @@
             });
         }
 
-        // Download handler
-        if (downloadBtn) {
-            downloadBtn.addEventListener('click', function(e) {
+        // Download boundary GPX handler
+        if (downloadBoundariesBtn) {
+            downloadBoundariesBtn.addEventListener('click', function(e) {
                 e.preventDefault();
                 const selected = Array.from(checks).filter(c => c.checked)
                     .map(c => c.dataset.cid)
@@ -166,6 +192,75 @@
                 }
                 // Trigger download via query param
                 window.location.href = `/download_gpx?session_id=${sid}&selected=${selected}&filename=${encodeURIComponent(filename)}`;
+            });
+        }
+
+        // Generate paths handler
+        if (generatePathsBtn) {
+            generatePathsBtn.addEventListener('click', function(e) {
+                e.preventDefault();
+                const selected = Array.from(checks).filter(c => c.checked)
+                    .map(c => c.dataset.cid)
+                    .join(',');
+                if (selected === '') {
+                    alert('Please select at least one cluster.');
+                    return;
+                }
+                const minArea = document.getElementById('min-area').value || 10;
+                // Fetch and visualize paths
+                fetch(`/get_path_json?session_id=${sid}&selected=${selected}&min_area=${minArea}`)
+                    .then(response => {
+                        if (!response.ok) {
+                            throw new Error('Failed to fetch path data');
+                        }
+                        return response.json();
+                    })
+                    .then(data => {
+                        if (data.error) {
+                            alert(data.error);
+                            return;
+                        }
+                        // Clear previous path layer
+                        if (window.pathLayer) {
+                            window.map.removeLayer(window.pathLayer);
+                        }
+                        // Add new paths
+                        window.pathLayer = L.layerGroup();
+                        data.paths.forEach(path => {
+                            window.pathLayer.addLayer(L.polyline(path, {color: 'red', weight: 3, dashArray: '5,10'}));
+                        });
+                        window.pathLayer.addTo(window.map);
+                        // Show download button and store params
+                        if (downloadPathGpxBtn) {
+                            downloadPathGpxBtn.classList.remove('hidden');
+                        }
+                        window.lastPathSelected = selected;
+                        window.lastPathMinArea = minArea;
+                    })
+                    .catch(error => {
+                        console.error('Error generating paths:', error);
+                        alert('Error generating paths on map.');
+                    });
+            });
+        }
+
+        // Download path GPX handler
+        if (downloadPathGpxBtn) {
+            downloadPathGpxBtn.addEventListener('click', function(e) {
+                e.preventDefault();
+                if (!window.lastPathSelected) {
+                    alert('No paths generated yet. Please generate paths first.');
+                    return;
+                }
+                let filename = prompt('Enter GPX file name (without extension):', '');
+                if (!filename || filename.trim() === '') {
+                    // Default to date-time
+                    const now = new Date();
+                    const pad = n => n.toString().padStart(2, '0');
+                    filename = `paths_${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())}_${pad(now.getHours())}-${pad(now.getMinutes())}-${pad(now.getSeconds())}`;
+                }
+                // Trigger download via query param
+                window.location.href = `/download_path_gpx?session_id=${sid}&selected=${window.lastPathSelected}&min_area=${window.lastPathMinArea}&filename=${encodeURIComponent(filename)}`;
             });
         }
     });

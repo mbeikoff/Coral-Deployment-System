@@ -1,15 +1,19 @@
-Flask
-pandas
-folium
-scikit-learn
-numpy
-shapely
-scipy
-geopandas
-flask-session
-flask-socketio
-eventlet
-gpxpy
-pyserial
-pynmea2
-flask_sqlalchemy
+Flask>=2.0.0
+pandas>=1.3.0
+folium>=0.12.0
+scikit-learn>=0.24.0
+numpy>=1.21.0
+shapely>=1.8.0
+scipy>=1.7.0
+geopandas>=0.9.0
+flask-session>=0.4.0
+flask-socketio>=5.1.0
+eventlet>=0.30.0
+gpxpy>=1.4.0
+pyserial>=3.5
+pynmea2>=1.18.0
+flask_sqlalchemy>=2.5.0
+requests>=2.26.0
+pyproj>=3.0.0
+Jetson.GPIO>=2.0.0  # Required for Jetson hardware
+python-socketio>=5.0.0  # Required by flask-socketio

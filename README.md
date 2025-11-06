@@ -41,6 +41,39 @@
 
 ---
 
+## Important New Features
+
+### Map Tile Caching
+The system now includes intelligent map tile caching for offline operation:
+
+- **How it works:**
+  - Map tiles are automatically cached when viewing areas in the map
+  - Cached tiles are stored in `storage/tile_cache/` organized by zoom/x/y coordinates
+  - Once cached, tiles remain available even without internet connection
+  - Supports zoom levels 5-22 for detailed satellite imagery
+
+- **To cache map areas:**
+  1. Start a new session
+  2. Pan and zoom around all areas you plan to work in
+  3. Try different zoom levels you might need
+  4. The system automatically saves these tiles for offline use
+
+- **Best practices:**
+  - Cache areas before field deployment
+  - Explore target areas at various zoom levels
+  - Verify cached areas by testing offline
+  - Remember to cache surrounding areas for navigation
+
+### Other Improvements
+- Enhanced GPS tracking with configurable path width
+- Real-time ultrasonic sensor feedback
+- Improved cluster visualization with convex hulls
+- Session resume capability
+- Comprehensive data export
+- Better offline operation support
+
+---
+
 ## IMPORTANT: API Key Setup Before Building Docker
 
 Before building the Docker container, you must set up your MapTiler API key. This ensures the container has access to the required API key for map tiles.
@@ -169,46 +202,60 @@ You can run the Coral Deployment System in two ways:
     python3 api_key_template.py
     ```
 
-**Note:** For production use, always run the app through Docker to ensure consistent environment and hardware access. Standalone mode is best for local development and testing.
+## System Features
 
-## Using the Web App
+### 1. Data Management
+- Upload and process CSV or GPX files
+- Automatic clustering of deployment points
+- Session management with resume capability
+- Comprehensive data export
 
-1. **Landing Page:** Start at the landing page.
-2. **New Session:** Click "New Session" to upload your CSV data file. Adjust clustering parameters as needed.
-3. **Dashboard:** After upload, you'll be redirected to the dashboard with an interactive map. The map shows patch points and clusters. Your GPS location (if enabled) will be tracked and compared to deployment zones.
-4. **Live Ultrasonic Sensor Data:**
-    - The dashboard displays live readings from an HC-SR04 ultrasonic sensor in the stats panel.
-    - When the sensor detects a distance below the deploy threshold (default 15cm), a real-time popup notification appears: "Coral sample deployed!"
-    - Sensor code is integrated directly in `app.py` and uses Jetson.GPIO for hardware access.
-    - Sensor initialization occurs after file upload/session start, preventing resource conflicts.
-5. **Cluster Management & GPX Export:**
-    - Clusters are shown in a sidebar with color badges and stats.
-    - You can toggle cluster visibility on the map and download selected clusters as GPX files for field navigation.
-6. **Session Summary:** End your session to view a summary of your deployment activity.
-7. **History/Help:** Use the navigation bar for session history or help.
+### 2. Map Interface
+- Interactive satellite map display
+- Offline map tile caching
+- Cluster visualization with convex hulls
+- Real-time GPS tracking
+- Configurable path width for better visibility
+- Multiple zoom levels (5-22)
 
-### File Upload Format
+### 3. Hardware Integration
+- Real-time ultrasonic sensor readings
+- Automated deployment detection
+- GPS position tracking and logging
+- Depth data integration
 
-Your CSV should include columns: `patch_id`, `patch_lat`, `patch_lon`, `patch_decision`, `ping_depth`, etc. Only rows with `patch_decision == 2` are clustered for deployment.
+### 4. Clustering & Navigation
+- DBSCAN-based point clustering
+- Convex hull boundary generation
+- GPX export for navigation
+- Cluster-specific statistics
 
-## Ultrasonic Sensor Integration
+### 5. Session Management
+- Live session tracking
+- Pausable/resumable sessions
+- Historical session viewing
+- Comprehensive session data export
 
-- The app uses Jetson.GPIO to read from an HC-SR04 ultrasonic sensor.
-- Sensor initialization and monitoring are managed in a background thread, started after session creation.
-- Live readings are sent to the dashboard via Flask-SocketIO.
-- If the sensor detects a distance below the deploy threshold, a popup notification is triggered in real time.
+## File Upload Format
 
-## Cluster Management & GPX Export
+### CSV Format
+Your CSV should include columns:
+- `patch_id`: Unique identifier
+- `patch_lat`: Latitude
+- `patch_lon`: Longitude
+- `patch_decision`: Decision code (0=reject, 1=maybe, 2=deploy)
+- `ping_depth`: Depth reading
 
-- Clusters are color-coded and listed in the sidebar.
-- You can toggle cluster visibility and download selected clusters as GPX files for use in GPS devices.
-- GPX export is available via the "Download Selected GPX" button.
+### GPX Format
+- Supports routes with waypoints
+- Each route becomes a cluster
+- Points automatically converted to deployment targets
 
 ## Requirements
 
 See `requirements.txt` for all dependencies. Main packages:
 
-- Flask
+- Flask & Flask extensions
 - pandas
 - folium
 - scikit-learn
@@ -216,32 +263,49 @@ See `requirements.txt` for all dependencies. Main packages:
 - shapely
 - scipy
 - geopandas
-- flask-session
-- flask-socketio
-- eventlet
 - gpxpy
 - pyserial
 - pynmea2
+- eventlet
+
+## Hardware Setup
+
+### Ultrasonic Sensor
+- Using HC-SR04 sensor
+- TRIG_PIN = 7 (Physical)
+- ECHO_PIN = 15 (Physical)
+- Run this command before starting:
+    ```bash
+    sudo busybox devmem 0x2448030 w 0xA
+    ```
+
+### GPS Module
+- Supports NMEA protocol
+- Configurable update rate
+- Provides position, speed, and quality metrics
 
 ## Troubleshooting
 
-- If you see a map tile error, check your MapTiler API key.
-- For missing packages, re-run `pip install -r requirements.txt`.
-- If the app doesn't start, ensure Python 3 is installed and you're in the correct directory.
-- For ultrasonic sensor issues, ensure your hardware is connected and Jetson.GPIO is installed.
-- If the dashboard freezes, ensure only one ultrasonic thread is running and the app is started with `eventlet` monkey patching.
-- For Docker issues, ensure you are using Docker version 27.5.1 and containerd 1.7.24 as described above.
+### Map Issues
+- If tiles don't load online: Check MapTiler API key
+- If tiles don't load offline: Ensure area was previously cached
+- To force cache refresh: Clear `storage/tile_cache` directory
 
-## Jetson GPIO Pin Setup
+### Hardware Issues
+- For ultrasonic errors: Check pin configuration
+- For GPS issues: Verify serial connection
+- For Docker access: Verify device permissions
 
-If you are running on Jetson hardware, you must configure the TRIG pin as an output before running the app. Run the following command in your terminal:
+### Data Issues
+- For CSV problems: Verify column names and format
+- For GPX issues: Ensure valid routes/waypoints
+- For session errors: Check storage permissions
 
-```bash
-sudo busybox devmem 0x2448030 w 0xA
-```
-
-This sets the TRIG GPIO pin to output mode (required for HC-SR04 operation).
+### System Issues
+- For memory errors: Reduce cached area size
+- For performance issues: Optimize zoom levels cached
+- For Docker issues: Verify version compatibility
 
 ---
 
-For more details, see comments in `app.py` or open an issue.
+For more details, see the source code or open an issue.

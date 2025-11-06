@@ -10,6 +10,7 @@
         .status-no-deploy { background: red; color: white; }
         .status-no-session { background: gray; color: white; }
         .readout { font-size: 1em; margin: 5px 0; }
+        .folium-map { height: 80vh; width: 100%; } /* Target .folium-map for sizing */
         h3 { font-size: 1.5em; margin-bottom: 10px; }
         #map-container { padding-bottom: 100px; }
         .fixed-bottom-row {
@@ -60,6 +61,20 @@
                     <div class="readout"><strong>Depth:</strong> <span id="depth">20 m</span></div>
                     <div class="readout"><strong>Ultrasonic Distance:</strong> <span id="ultrasonic-distance">{{ stats.ultrasonic_distance }} cm</span></div>
                 </div>
+                <!-- Recenter Map button: placed under the stats box (not inside it) -->
+                <div class="mb-3">
+                    <button id="recenter-map" class="btn btn-primary btn-sm w-100" aria-label="Recenter map to GPS or clusters">Recenter Map</button>
+                </div>
+                <!-- NEW: Points Toggle -->
+                <div class="mb-3">
+                    <div class="form-check">
+                        <input class="form-check-input" type="checkbox" id="toggle-points">
+                        <label class="form-check-label" for="toggle-points">
+                            Show Points
+                        </label>
+                    </div>
+                </div>
+                <!-- End NEW -->
             </div>
             <div class="col-md-9">
                 <div id="map-container">{{ map_html | safe }}</div>
@@ -100,7 +115,6 @@
         </div>
     </div>
     <!-- End Modal -->
-
     <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
     <script>
@@ -117,28 +131,105 @@
     // Store latest GPS for optional replay on map ready
     window.latestGps = null;
 
-    // Helper to update map (extracted for reuse) - now using direct marker
+    // Helper to update map (extracted for reuse)
     function updateMapWithGps(data) {
-        if (window.map && window.gpsMarker) {
-            console.log('Updating map with GPS:', data.lat, data.lon);  // Debug log
-            // Update GPS marker directly
-            window.gpsMarker.setLatLng([data.lat, data.lon]);
-            // Optionally update popup content silently
-            window.gpsMarker.getPopup().setContent(`GPS Position<br>Lat: ${data.lat}<br>Lon: ${data.lon}<br>Quality: ${data.qual}`);
-            // REMOVED: window.gpsMarker.openPopup();  // No auto-open
+        if (window.map && window.realtime) {
+            // Update realtime marker with GeoJSON (note: GeoJSON coords are [lon, lat])
+            var geojson = {
+                type: 'FeatureCollection',
+                features: [{
+                    type: 'Feature',
+                    geometry: {type: 'Point', coordinates: [data.lon, data.lat]},
+                    properties: {id: 'gps'}
+                }]
+            };
+            window.realtime.update(geojson);
 
             // Lazy init trail and add point (Leaflet LatLng is [lat, lon])
             if (!window.gpsTrail) {
-                window.gpsTrail = L.polyline([], {color: '#3388ff', weight: 4, opacity: 0.8}).addTo(window.map);
-                console.log('GPS trail initialized');
+                // Use server-stored path width (meters) as the polyline weight in pixels
+                var pathWidth = {{ settings.path_width_m | default(4) }};
+                window.gpsTrail = L.polyline([], {color: '#3388ff', weight: pathWidth, opacity: 0.8}).addTo(window.map);
+                console.log('GPS trail initialized (weight:', pathWidth, ')');
             }
             window.gpsTrail.addLatLng([data.lat, data.lon]);
 
             // Auto-pan to new position
             window.map.panTo([data.lat, data.lon], {animate: true, duration: 0.5});
         } else {
-            console.log('Map or gpsMarker not ready yet for GPS update');
+            console.log('Map or realtime not ready yet for GPS update');
         }
+    }
+
+    // Recenter map to latest GPS if available, otherwise cluster centers from map layers, else use map's default/current center
+    function recenterMap() {
+        if (!window.map) {
+            // Map not ready yet — remember to recenter when it is
+            window.pendingRecenter = true;
+            console.log('Map not ready; pending recenter');
+            return;
+        }
+
+        // Prefer live GPS position
+        if (window.latestGps && window.latestGps.lat !== undefined && window.latestGps.lon !== undefined) {
+            window.map.panTo([window.latestGps.lat, window.latestGps.lon], {animate: true, duration: 0.5});
+            return;
+        }
+
+        // Attempt to collect cluster centers from Leaflet layers only (DOM checkboxes are intentionally removed)
+        const centers = [];
+        if (window.map && window.map.eachLayer) {
+            window.map.eachLayer(function(layer) {
+                try {
+                    // Heuristic: cluster layers created in server-side code are named like 'Cluster X'
+                    if (layer && layer.options && layer.options.name && String(layer.options.name).toLowerCase().startsWith('cluster')) {
+                        if (typeof layer.getBounds === 'function') {
+                            const b = layer.getBounds();
+                            if (b && b.isValid && b.isValid()) {
+                                const c = b.getCenter();
+                                centers.push([c.lat, c.lng]);
+                                return;
+                            }
+                        }
+                        if (typeof layer.getLatLng === 'function') {
+                            const p = layer.getLatLng();
+                            if (p) centers.push([p.lat, p.lng]);
+                        }
+                    }
+                } catch (e) {
+                    // ignore layer inspection errors
+                }
+            });
+        }
+
+        // If cluster centers found, fit bounds or center appropriately
+        if (centers.length === 1) {
+            window.map.setView(centers[0], 15);
+            return;
+        }
+        if (centers.length > 1) {
+            const bounds = L.latLngBounds(centers);
+            try {
+                window.map.fitBounds(bounds.pad ? bounds.pad(0.15) : bounds, {animate: true});
+            } catch (e) {
+                window.map.fitBounds(bounds, {animate: true});
+            }
+            return;
+        }
+
+        // Fallback: use the map's current/default center (this reflects the default GPS/center used when the map was created)
+        try {
+            const c = window.map.getCenter();
+            if (c) {
+                window.map.panTo([c.lat, c.lng], {animate: true, duration: 0.5});
+                return;
+            }
+        } catch (e) {
+            console.warn('Failed to get map center for recenter fallback', e);
+        }
+
+        // Nothing to do — silently return
+        console.warn('Recenter: no GPS and no cluster centers found; map center fallback unavailable');
     }
 
     // Ultrasonic update (independent of DOM/map)
@@ -216,20 +307,23 @@
         });
     }, 1000);
 
-    // Wait for map to load and replay any stored GPS
+    // Cluster selection and toggle JS (runs after DOM ready)
     document.addEventListener('DOMContentLoaded', function() {
         console.log('DOM loaded');
+        const checks = document.querySelectorAll('.cluster-check');
+
+        // Wait for map to load before attaching toggles
         const mapCheckInterval = setInterval(function() {
             if (window.map) {
                 clearInterval(mapCheckInterval);
-                console.log('Map loaded, checking for GPS replay');
-                
-                // Replay latest GPS if stored (fixes timing issue)
-                if (window.latestGps) {
-                    console.log('Replaying stored GPS data');
-                    updateMapWithGps(window.latestGps);
-                    // Optional: Clear after replay to avoid duplicates on next update
-                    window.latestGps = null;
+                console.log('Map loaded, attaching toggles');
+                attachToggleListeners();
+                // NEW: Attach points toggle
+                attachPointsToggle();
+                // If a recenter was requested while the map was not ready, run it now
+                if (window.pendingRecenter) {
+                    try { recenterMap(); } catch (e) { console.warn('Recenter failed after map load', e); }
+                    window.pendingRecenter = false;
                 }
             }
         }, 200);
@@ -239,6 +333,68 @@
         document.getElementById('end-session-btn').addEventListener('click', function() {
             endModal.show();
         });
+
+        function attachToggleListeners() {
+            checks.forEach(function(check) {
+                check.addEventListener('change', function() {
+                    const cid = this.dataset.cid;
+                    const checked = this.checked;
+                    // Recursive toggle function
+                    function findAndToggle(layer) {
+                        if (layer.options && layer.options.name === `Cluster ${cid}`) {
+                            if (checked) {
+                                window.map.addLayer(layer);
+                            } else {
+                                window.map.removeLayer(layer);
+                            }
+                            return true;
+                        }
+                        if (layer.getLayers && layer.getLayers().length > 0) {
+                            for (let child of layer.getLayers()) {
+                                if (findAndToggle(child)) return true;
+                            }
+                        }
+                        return false;
+                    }
+                    window.map.eachLayer(findAndToggle);
+                });
+            });
+        }
+
+        // NEW: Points toggle handler
+        function attachPointsToggle() {
+            const pointsToggle = document.getElementById('toggle-points');
+            if (pointsToggle && window.pointsLayer && window.map) {
+                console.log('Attaching points toggle; pointsLayer ready:', !!window.pointsLayer); // DEBUG: Confirm init
+                // Initially hidden (unchecked by default)
+                if (pointsToggle.checked) {
+                    window.map.addLayer(window.pointsLayer);
+                } else {
+                    window.map.removeLayer(window.pointsLayer);
+                }
+                pointsToggle.addEventListener('change', function() {
+                    if (this.checked) {
+                        window.map.addLayer(window.pointsLayer);
+                        console.log('Points shown (under clusters)'); // DEBUG
+                    } else {
+                        window.map.removeLayer(window.pointsLayer);
+                        console.log('Points hidden'); // DEBUG
+                    }
+                });
+            } else {
+                console.warn('Points toggle setup failed; check map/pointsLayer init'); // DEBUG
+            }
+        }
+        // End NEW
+
+        // Recenter button handler
+        const recenterBtn = document.getElementById('recenter-map');
+        if (recenterBtn) {
+            recenterBtn.addEventListener('click', function(e) {
+                e.preventDefault();
+                recenterMap();
+            });
+        };
 
         const sid = {{ sid }};
         document.getElementById('discard-btn').addEventListener('click', function() {
