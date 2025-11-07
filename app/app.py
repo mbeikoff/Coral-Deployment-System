@@ -1594,7 +1594,7 @@ def dashboard():
     labeled_deploy_df = data['labeled_deploy_df']
     valid_clusters = data['valid_clusters']
     # Predefined colors for clusters
-    colors = ['red', 'blue', 'green', 'orange', 'purple', 'brown', 'pink', 'gray', 'olive', 'cyan']
+    colors = ['green', 'blue', 'salmon', 'orange', 'purple', 'brown', 'pink', 'gray', 'olive', 'cyan']
     # Prepare cluster_info for template
     cluster_info = []
     cluster_layers_js = [] # JS to add cluster layers
